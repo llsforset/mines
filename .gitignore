@@ -60,3 +60,7 @@ dist/
 
 # Flag to show that go-assets.sh has been run
 .downloaded_assets
+
+
+implant/lite/config.h
+implant/lite/dist/
