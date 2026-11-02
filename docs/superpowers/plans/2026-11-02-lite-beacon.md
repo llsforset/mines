@@ -1389,6 +1389,18 @@ func mustSecret(t *testing.T, entry SecretEntry) []byte {
 	return secret
 }
 
+// postRaw sends an already-sealed JSON envelope verbatim (for replay tests).
+func postRaw(t *testing.T, addr string, body []byte) *http.Response {
+	t.Helper()
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}} //nolint:gosec
+	resp, err := client.Post("https://"+addr+DefaultPath, "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	return resp
+}
+
 func TestListenerFullRoundTrip(t *testing.T) {
 	lis, store, secrets, entry := startTestListener(t)
 	addr := lis.Addr().String()
@@ -1499,14 +1511,15 @@ func TestListenerCamouflage(t *testing.T) {
 		{Type: tlvBeaconID, Value: []byte("replay-01")},
 		{Type: tlvTimestamp, Value: u64b(now)},
 	})
-	resp, _ = postCheckin(t, addr, DefaultPath, entry, plain)
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	// replay → 404：构造一次 seal 的原始密文体原样重发（重新 seal 会换 nonce，测不出重放）
+	sealed, err := sealBody(entry.KeyName, deriveKey(mustSecret(t, entry)), plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp := postRaw(t, addr, sealed); resp.StatusCode != http.StatusOK {
 		t.Fatalf("first check-in failed: %d", resp.StatusCode)
 	}
-	resp, _ = postCheckin(t, addr, DefaultPath, entry, plain)
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound {
+	if resp := postRaw(t, addr, sealed); resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("replay must be rejected with 404, got %d", resp.StatusCode)
 	}
 
@@ -1629,7 +1642,8 @@ func Start(cfg ListenerConfig, store *Store, secrets *SecretRegistry) (*Listener
 	if err != nil {
 		return nil, err
 	}
-	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
 		return nil, err
 	}
 	l := &Listener{store: store, secrets: secrets, path: path}
@@ -1638,6 +1652,7 @@ func Start(cfg ListenerConfig, store *Store, secrets *SecretRegistry) (*Listener
 	l.server = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 15 * time.Second,
+		TLSConfig:         &tls.Config{Certificates: []tls.Certificate{cert}},
 	}
 	ln, err := net.Listen("tcp", net.JoinHostPort(cfg.Host, fmt.Sprint(cfg.Port)))
 	if err != nil {
@@ -1645,7 +1660,7 @@ func Start(cfg ListenerConfig, store *Store, secrets *SecretRegistry) (*Listener
 	}
 	l.ln = ln
 	go func() {
-		_ = l.server.ServeTLS(ln, certPEM, keyPEM)
+		_ = l.server.ServeTLS(ln, "", "")
 	}()
 	return l, nil
 }
