@@ -132,7 +132,8 @@ plaintext = TLV 帧序列：[type:1B][len:2B LE][value:lenB] 串接
 - 单一端点：`POST /<path>`，path 为构建期配置的普通字符串
   （默认 `/api/v2/sync`，可改）。
 - 成功：200 + 应答体（同格式编码的下行 TLV；无任务时空任务帧）。
-- secret 未登记 / 解密失败 / 时间戳过期：404 + 空体，端点不暴露存在性。
+- secret 未登记 / 解密失败 / 时间戳过期 / 重放：与其他未知请求一致，
+  返回 nginx 风格 404 页面，端点不暴露存在性。
 - GET 及其他路径：返回静态的普通站点缺省页（nginx 风格 404 页面），
   使监听端口看起来是台普通 Web 服务器。
 - 植入体侧：失败静默退避（1s 起指数递增，上限 = 当前回连间隔），
@@ -183,11 +184,12 @@ Dockerfile debian 构建 env：gcc + libssl-dev + gcc-mingw-w64-x86-64 + binutil
 |---|---|
 | `POST /api/lite/listener/start` | {host, port, path} |
 | `POST /api/lite/listener/stop` | |
-| `POST /api/lite/config` | 签发新 secret（旧 secret 保留有效），返回 url、secretHex、可直接保存的 config.h 文本 |
+| `POST /api/lite/config` | 签发新 secret（旧 secret 保留有效），返回 url、secret（base64）、可直接保存的 config.h 文本 |
 | `GET /api/lite/config` | 返回最新 secret 与对应 config.h 文本（不新建） |
 | `GET /api/lite/beacons` | 信标列表：id/主机信息/firstSeen/lastSeen |
 | `POST /api/lite/task` | {beaconId, type: exec\|read, cmd\|path} → taskId |
 | `GET /api/lite/results` | ?beacon=xx 取回结果（读取即消费） |
+| `POST /api/lite/beacon/delete` | 从列表删除信标（控制台清理用，非植入体功能） |
 
 `static/app.js` 新增「轻量信标」面板：监听器启停、config.h 下发、
 信标表、任务下发表单、结果查看。样式沿用现有面板。
