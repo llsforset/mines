@@ -1125,7 +1125,6 @@ Expected: FAIL（`LoadSecrets` 未定义）
 package litebeacon
 
 import (
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"os"
