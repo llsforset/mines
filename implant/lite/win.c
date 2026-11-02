@@ -11,7 +11,6 @@
 
 int sys_init(void) { return 0; }
 void sys_shutdown(void) {}
-void sys_free(void *p) { free(p); }
 
 void rand_bytes(unsigned char *out, size_t n) {
     typedef BOOLEAN(WINAPI * rtlgenrandom_fn)(unsigned char *, unsigned long);

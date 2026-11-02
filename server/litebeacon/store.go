@@ -4,7 +4,11 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/bishopfox/sliver/server/log"
 )
+
+var storeLog = log.NamedLogger("litebeacon", "store")
 
 const (
 	maxQueuedTasks  = 32
@@ -101,7 +105,9 @@ func (s *Store) QueueTask(id string, t Task) (Task, bool) {
 	t.ID = s.taskSeq
 	st.tasks = append(st.tasks, t)
 	if len(st.tasks) > maxQueuedTasks {
+		dropped := st.tasks[0]
 		st.tasks = st.tasks[len(st.tasks)-maxQueuedTasks:]
+		storeLog.Warnf("beacon %s task queue full: dropped oldest task %d (%#x)", id, dropped.ID, dropped.Type)
 	}
 	return t, true
 }

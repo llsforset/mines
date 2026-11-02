@@ -39,6 +39,10 @@ func GenerateConfigH(p ConfigParams) (string, error) {
 	if p.URL == "" || p.KeyName == "" || p.UserAgent == "" {
 		return "", fmt.Errorf("empty config field")
 	}
+	// 植入体解码缓冲为 512 字节，URL 必须留出余量
+	if len(p.URL) > 500 {
+		return "", fmt.Errorf("url too long: %d bytes (max 500)", len(p.URL))
+	}
 	if p.BaseIntervalSec == 0 {
 		p.BaseIntervalSec = 180
 	}

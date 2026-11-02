@@ -12,7 +12,6 @@
 
 int  sys_init(void);
 void sys_shutdown(void);
-void sys_free(void *p);
 
 /* HTTPS POST; returns 0 on transport success. Caller frees *resp. */
 int  http_post(const char *url, const char *ua, const char *body, size_t body_len,

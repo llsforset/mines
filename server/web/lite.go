@@ -90,6 +90,11 @@ func (s *Service) liteTask(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "命令不能为空")
 			return
 		}
+		// TLV u16 上限内还需留出帧头，超长命令在这里拦下而不是丢进队列后被静默丢弃
+		if len(body.Cmd) > 60000 {
+			writeErr(w, http.StatusBadRequest, "命令太长，上限 60000 字节")
+			return
+		}
 		task.Type = litebeacon.TaskExec
 		if body.Timeout <= 0 || body.Timeout > 600 {
 			body.Timeout = 30

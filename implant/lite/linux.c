@@ -21,7 +21,6 @@
 
 int sys_init(void) { return 0; }
 void sys_shutdown(void) {}
-void sys_free(void *p) { free(p); }
 
 void rand_bytes(unsigned char *out, size_t n) {
     if (RAND_bytes(out, (int)n) != 1) exit(1);
@@ -292,7 +291,7 @@ int read_file_bytes(const char *path, unsigned char **out, size_t *out_len, int 
     }
     if (fstat(fd, &st) != 0 || S_ISDIR(st.st_mode)) {
         close(fd);
-        *err_code = 1;
+        *err_code = 2; /* 目录/状态异常按“拒绝”处理，与 Windows 端一致 */
         *out = (unsigned char *)malloc(1);
         *out_len = 0;
         return 0;
