@@ -73,10 +73,10 @@ func Start(cfg ListenerConfig, store *Store, secrets *SecretRegistry) (*Listener
 		return nil, err
 	}
 	l := &Listener{store: store, secrets: secrets, path: path}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", l.handler)
+	// 不用 ServeMux：mux 对未清洗路径在进 handler 前回 301，
+	// 绕过 nginx 封面，是指纹口子
 	l.server = &http.Server{
-		Handler:           mux,
+		Handler:           http.HandlerFunc(l.handler),
 		ReadHeaderTimeout: 15 * time.Second,
 		TLSConfig:         &tls.Config{Certificates: []tls.Certificate{cert}},
 	}

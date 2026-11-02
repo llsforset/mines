@@ -135,6 +135,9 @@ func TestListenerCamouflage(t *testing.T) {
 	}
 	page, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	if resp.Header.Get("Server") != "nginx" {
+		t.Fatalf("GET cover page Server header wrong: %q", resp.Header.Get("Server"))
+	}
 	if resp.StatusCode != http.StatusNotFound || !bytes.Contains(page, []byte("nginx")) {
 		t.Fatalf("GET cover page wrong: %d %s", resp.StatusCode, page)
 	}
