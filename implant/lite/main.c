@@ -236,6 +236,15 @@ static void do_read_task(uint32_t task_id, const char *path, buf_t *results) {
     free(out);
 }
 
+/* TLV strings are length-delimited, not NUL-terminated: copy + terminate. */
+static char *tlv_str(const unsigned char *src, size_t n) {
+    char *s = (char *)malloc(n + 1);
+    if (!s) return NULL;
+    memcpy(s, src, n);
+    s[n] = '\0';
+    return s;
+}
+
 static void run_tasks(const buf_t *tasks, buf_t *results) {
     const unsigned char *p = tasks->data;
     size_t remain = tasks->len;
@@ -250,16 +259,26 @@ static void run_tasks(const buf_t *tasks, buf_t *results) {
             if (n >= 6) {
                 uint32_t task_id;
                 int timeout_sec;
+                char *cmd;
                 memcpy(&task_id, v, 4);
                 timeout_sec = (int)v[4] | ((int)v[5] << 8);
-                do_exec_task(task_id, (const char *)(v + 6), timeout_sec, results);
+                cmd = tlv_str(v + 6, n - 6);
+                if (cmd) {
+                    do_exec_task(task_id, cmd, timeout_sec, results);
+                    free(cmd);
+                }
             }
             break;
         case TLV_READ_TASK:
             if (n >= 4) {
                 uint32_t task_id;
+                char *path;
                 memcpy(&task_id, v, 4);
-                do_read_task(task_id, (const char *)(v + 4), results);
+                path = tlv_str(v + 4, n - 4);
+                if (path) {
+                    do_read_task(task_id, path, results);
+                    free(path);
+                }
             }
             break;
         case TLV_SLEEP_TASK:
