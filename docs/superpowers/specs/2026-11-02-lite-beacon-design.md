@@ -44,14 +44,53 @@ C 里实现成本高且抵消体积目标），走独立的极简二进制协议
 - 已知取舍：持有共享密钥前的中间人最多做到丢弃流量（降级为 DoS），
   无法注入。接受该取舍。
 
+### 流量外形（外部特征对抗）
+
+安全设备的识别点在加密之外的可观测外形，逐项对照并给出设计约束：
+
+**TLS 指纹：C 版天然规避 Go 特征。** 植入体不使用 Go TLS——Windows 走
+WinHTTP（Schannel，与 Windows 系统组件、大量桌面软件同栈），Linux 走
+OpenSSL（与 curl 及大量 C/S 软件同栈）。握手指纹呈现为「普通系统软件」
+而非「Go 程序」，这是 C 重写相对 Go 版最大的外形收益。服务端 TLS 指纹
+为常规 Go `crypto/tls`，如需进一步遮蔽可按常规做法前置 nginx/CDN 回源
+（运维选项，不纳入实现）。不使用客户端证书，永不使用双向 TLS。
+
+**证书：不复用 Sliver 的证书生成特征。** Sliver `randomSubject` 生成的
+自签证书已被公开规则覆盖，lite 监听器另行生成无个性的自签证书；对外
+正式目标走 ACME 签发可信证书，消除企业代理「客户端接受不可信证书」的
+告警面。AEAD 仍承担全部身份认证，证书仅影响外形。
+
+**连接节奏：随机化打破心跳规律。** 无长连接——每次回连只有一条短命
+POST，连接即断。间隔逐轮重算，而非固定值加小抖动：
+
+- 首连延迟 uniform(5, 30) 秒，切断「部署→立即上线」的时间关联；
+- 下一轮间隔 = base × uniform(0.5, 1.7)，另有 8% 概率再乘
+  uniform(2.0, 3.0)，让长期间隔直方图不聚簇；
+- base 默认 180 秒，构建时可调；
+- 任务完成后的结果回传延迟 uniform(1, 4) 秒，拆开「收到任务→立刻
+  回连」的强关联。
+
+**HTTP 外形：呈现软件遥测客户端，不冒充浏览器。** UA 必须与 TLS 栈
+自洽——schannel/OpenSSL 的握手不是浏览器，用 Chrome UA 与 sec-ch-ua
+头部会形成「头说是浏览器、握手不是」的自相矛盾。因此呈现低存在感的
+同步/遥测客户端外形：完整但非浏览器的头部集（Host、UA、Accept:
+application/json、Accept-Language、Content-Type），UA 从构建期配置池
+中固定选取一个真实软件组件 UA；载荷外层 JSON 信封（见 3.1）；体长经
+0x0F 填充 TLV 逐次变化；监听器应答头为普通 JSON 服务外观，不携带
+Sliver 默认 profile 的响应头特征。
+
 ## 3. 协议设计
 
 ### 3.1 载荷编码
 
 ```
-HTTP body = base64( nonce[12] || AES-256-GCM(key, nonce, plaintext) )
+HTTP body = {"<key>": "<base64( nonce[12] || AES-256-GCM(key, nonce, plaintext) )>"}
 plaintext = TLV 帧序列：[type:1B][len:2B LE][value:lenB] 串接
 ```
+
+- 外层为 JSON 信封：`<key>` 为构建期从候选池选定的普通字段名，请求
+  Content-Type 为 `application/json`，避免裸发高熵 base64 体。
+- 请求与应答同格式。
 
 - AES-256-GCM，nonce 随机 12 字节。
 - `key = SHA-256( secret || "litebeacon/aead/v1" )`，secret 为 32 字节
@@ -85,12 +124,17 @@ plaintext = TLV 帧序列：[type:1B][len:2B LE][value:lenB] 串接
 | 0x42 | 调整间隔 | [interval_sec u32][jitter_pct u8] |
 | 0x43 | 退出 | 空（植入体收到后静默退出） |
 
+任意方向均可插入 0x0F 填充 TLV：值为随机字节（0-256B），接收方解出后
+忽略，用于消除请求/响应体长度的定长聚簇特征。
+
 ### 3.3 HTTP 语义
 
-- 单一端点：`POST /<path>`，path 为启动监听器时配置的普通字符串
-  （默认 `/upload`）。
+- 单一端点：`POST /<path>`，path 为构建期配置的普通字符串
+  （默认 `/api/v2/sync`，可改）。
 - 成功：200 + 应答体（同格式编码的下行 TLV；无任务时空任务帧）。
 - secret 未登记 / 解密失败 / 时间戳过期：404 + 空体，端点不暴露存在性。
+- GET 及其他路径：返回静态的普通站点缺省页（nginx 风格 404 页面），
+  使监听端口看起来是台普通 Web 服务器。
 - 植入体侧：失败静默退避（1s 起指数递增，上限 = 当前回连间隔），
   连续失败不退出。
 
@@ -113,15 +157,18 @@ build.sh   参数：--platform win|linux --url --secret-hex --interval --jitter 
 Dockerfile debian 构建 env：gcc + libssl-dev + gcc-mingw-w64-x86-64 + binutils
 ```
 
-- 配置（URL、secret、间隔、jitter、路径）由 build.sh 生成 `config.h`，
-  内含随机单字节 XOR 混淆的字节数组，运行时解码，产物内搜不到明文 C2 域名。
+- 配置（URL、路径、secret、间隔、UA、JSON 字段名、节奏算法参数）由
+  build.sh 生成 `config.h`，内含随机单字节 XOR 混淆的字节数组，运行时
+  解码，产物内搜不到明文 C2 域名。
 - 编译 `-Os -s -fno-ident -fno-unwind-tables`，无符号无调试信息。
 - 代码内不出现 "beacon/implant/sliver" 等字符串；源码符号命名中性。
 
 ### 4.2 服务端 — `server/litebeacon/`
 
-- `Start(host, port, path) / Stop()` 单实例监听器，TLS 证书复用
-  `certs.HTTPSGenerateRSACertificate`（自签，存于 `~/.sliver/certs/https/`）。
+- `Start(host, port, path) / Stop()` 单实例监听器；TLS 证书自签生成，
+  subject 为无个性普通值（不复用 Sliver `randomSubject` 的生成特征），
+  存于 `~/.sliver/litebeacon/`；对外正式目标支持 ACME 签发
+  （复用现有 `certs/acme.go`），消除企业代理的不可信证书告警面。
 - secret 登记：持久化于 `~/.sliver/litebeacon/secrets.json`，全部有效，
   支持多信标共存与轮换。
 - 内存态：每个信标的待下发任务队列（上限 32）与结果环形缓冲
@@ -161,6 +208,8 @@ Dockerfile debian 构建 env：gcc + libssl-dev + gcc-mingw-w64-x86-64 + binutil
   `host.docker.internal` 完成上线与命令回传验证。
 - Windows 版：docker mingw 交叉编译验证产物可构建、体积、`strings`
   卫生检查；目标机功能由操作人验证（协议核心与 Linux 版共用）。
+- 外形自检：抓包核对请求头集合与 UA 自洽、TLS 指纹非 Go 客户端栈、
+  请求体长度多次采样不聚簇；服务端核对无 Sliver 默认 profile 响应头。
 
 ## 7. 交付物清单
 
