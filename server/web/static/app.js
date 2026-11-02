@@ -603,12 +603,16 @@ async function renderLite(view) {
   });
   view.innerHTML = `
     <form id="lite-listen" class="panel"><h3>轻量信标监听</h3>
-      <p class="hint">C 植入体连这个独立端口，走轻量协议，和 Sliver 监听互不相干。${cfg.running ? "正在监听：" + esc(cfg.addr) : "当前没在监听。"}</p>
+      <p class="hint">C 植入体连这个独立端口，走轻量协议，和 Sliver 监听互不相干。${cfg.running ? "正在监听：" + esc(cfg.addr) : "当前没在监听。"}间隔策略：平时 ${cfg.idleSec} 秒 / 干活 ${cfg.fastSec} 秒（干活 = 5 分钟内排过任务或拉过结果，期间自动切快、停手 5 分钟后回落）。</p>
       <div class="row">
         <label>监听地址<input name="host" value="0.0.0.0"></label>
         <label>端口<input name="port" value="8443"></label>
         <label>路径<input name="path" value="/api/v2/sync"></label>
         <label>目标看到的地址<input name="url" placeholder="https://c2.example.com:8443"></label>
+      </div>
+      <div class="row">
+        <label>平时回连秒数<input name="idleSec" value="10"></label>
+        <label>干活时回连秒数<input name="fastSec" value="10"></label>
       </div>
       <button type="submit">${cfg.running ? "重启监听" : "启动监听"}</button>
       ${cfg.running ? '<button type="button" class="danger" id="lite-stop">停止</button>' : ""}
@@ -647,6 +651,7 @@ async function renderLite(view) {
       if (cfg.running) await api("/api/lite/listener/stop", { method: "POST", json: {} });
       const res = await api("/api/lite/listener/start", { method: "POST", json: {
         host: form.get("host"), port: Number(form.get("port")), path: form.get("path"), url: form.get("url"),
+        idleSec: Number(form.get("idleSec") || 10), fastSec: Number(form.get("fastSec") || 10),
       }});
       $("lite-note").textContent = "已监听 " + res.addr;
       setTimeout(render, 400);

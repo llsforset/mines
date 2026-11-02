@@ -45,6 +45,34 @@ func TestBuildTaskPayloadRejectsOversizeValue(t *testing.T) {
 	}
 }
 
+func TestBuildCheckinResponse(t *testing.T) {
+	tasks, err := buildTaskPayload([]Task{{ID: 9, Type: TaskExit}}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := buildCheckinResponse(tasks, 10, 7)
+	items, err := decodeTLVs(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hint *tlv
+	var pad *tlv
+	for i := range items {
+		switch items[i].Type {
+		case tlvNextHint:
+			hint = &items[i]
+		case tlvPad:
+			pad = &items[i]
+		}
+	}
+	if hint == nil || len(hint.Value) != 4 || binary.LittleEndian.Uint32(hint.Value) != 10 {
+		t.Fatalf("missing/bad interval hint: %#v", hint)
+	}
+	if pad == nil || len(pad.Value) != 7 {
+		t.Fatalf("missing/bad pad: %#v", pad)
+	}
+}
+
 func TestParseCheckin(t *testing.T) {
 	now := uint64(1770000000)
 	plain := encodeTLVs([]tlv{

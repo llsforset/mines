@@ -40,6 +40,7 @@ func TestLiteImplantE2E(t *testing.T) {
 	}
 	entry, _ := secrets.Latest()
 	store := NewStore()
+	store.SetIntervalPolicy(10, 5) // e2e 用快间隔策略，活跃轮 2.5~8.5 秒
 
 	lis, err := Start(ListenerConfig{Host: "0.0.0.0", Port: 0}, store, secrets)
 	if err != nil {
@@ -53,7 +54,7 @@ func TestLiteImplantE2E(t *testing.T) {
 		SecretB64:       entry.SecretB64,
 		KeyName:         entry.KeyName,
 		UserAgent:       "DeviceSync/2.0.7 (Linux x86_64)",
-		BaseIntervalSec:  5, // fast loop for the test
+		BaseIntervalSec: 5, // fast loop for the test
 	})
 	if err != nil {
 		t.Fatal(err)

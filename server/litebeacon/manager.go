@@ -10,7 +10,7 @@ import (
 	"github.com/bishopfox/sliver/server/assets"
 )
 
-const defaultIntervalSec = 180
+const defaultIntervalSec = 10 // 签发缺省值：跟随空闲策略（用户决策：两档默认都 10s）
 
 var (
 	mgrMutex   sync.Mutex
@@ -34,7 +34,9 @@ func defaultManager() (*Store, *SecretRegistry, error) {
 }
 
 // StartDefault starts (or replaces) the singleton console-managed listener.
-func StartDefault(host string, port int, path, externalURL string) (string, error) {
+// idleSec/fastSec 是自适应间隔策略：空闲回连用 idleSec，操作员活跃窗口内用
+// fastSec；0 = 用缺省（10s）。clamp 范围 5..86400。
+func StartDefault(host string, port int, path, externalURL string, idleSec, fastSec int) (string, error) {
 	mgrMutex.Lock()
 	defer mgrMutex.Unlock()
 	_, _, err := defaultManager()
@@ -48,6 +50,7 @@ func StartDefault(host string, port int, path, externalURL string) (string, erro
 	if host == "" {
 		host = "0.0.0.0"
 	}
+	mgrStore.SetIntervalPolicy(uint32(idleSec), uint32(fastSec))
 	// port == 0 让系统分配临时端口（测试用）；控制台表单默认给 8443
 	lis, err := Start(ListenerConfig{Host: host, Port: port, Path: path}, mgrStore, mgrSecrets)
 	if err != nil {
@@ -91,6 +94,8 @@ type ConfigInfo struct {
 	URL       string `json:"url"`
 	SecretB64 string `json:"secretB64"`
 	ConfigH   string `json:"configH"`
+	IdleSec   uint32 `json:"idleSec"`
+	FastSec   uint32 `json:"fastSec"`
 }
 
 func currentURL() string {
@@ -101,17 +106,21 @@ func currentURL() string {
 }
 
 func buildInfo(entry SecretEntry) (ConfigInfo, error) {
+	idle, fast := defaultIdleIntervalSec, defaultFastIntervalSec
+	if mgrStore != nil {
+		idle, fast = mgrStore.IntervalPolicy()
+	}
 	cfgH, err := GenerateConfigH(ConfigParams{
 		URL:             currentURL(),
 		SecretB64:       entry.SecretB64,
 		KeyName:         entry.KeyName,
 		UserAgent:       RandomUserAgent(),
-		BaseIntervalSec: defaultIntervalSec,
+		BaseIntervalSec: idle, // 首轮间隔跟随当前空闲策略，之后由 0x44 提示接管
 	})
 	if err != nil {
 		return ConfigInfo{}, err
 	}
-	info := ConfigInfo{URL: currentURL(), SecretB64: entry.SecretB64, ConfigH: cfgH}
+	info := ConfigInfo{URL: currentURL(), SecretB64: entry.SecretB64, ConfigH: cfgH, IdleSec: idle, FastSec: fast}
 	if mgrLis != nil {
 		info.Running = true
 		info.Addr = mgrLis.Addr().String()

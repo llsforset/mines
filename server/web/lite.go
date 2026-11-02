@@ -8,16 +8,18 @@ import (
 
 func (s *Service) liteListenerStart(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Host string `json:"host"`
-		Port int    `json:"port"`
-		Path string `json:"path"`
-		URL  string `json:"url"`
+		Host    string `json:"host"`
+		Port    int    `json:"port"`
+		Path    string `json:"path"`
+		URL     string `json:"url"`
+		IdleSec int    `json:"idleSec"` // 空闲回连间隔，0=默认10
+		FastSec int    `json:"fastSec"` // 活跃窗口内的回连间隔，0=默认10
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, "监听参数不合法")
 		return
 	}
-	addr, err := litebeacon.StartDefault(body.Host, body.Port, body.Path, body.URL)
+	addr, err := litebeacon.StartDefault(body.Host, body.Port, body.Path, body.URL, body.IdleSec, body.FastSec)
 	if err != nil {
 		rpcErr(w, err)
 		return

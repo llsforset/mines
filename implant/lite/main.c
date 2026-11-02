@@ -26,6 +26,7 @@
 #define TLV_READ_TASK 0x41
 #define TLV_SLEEP_TASK 0x42
 #define TLV_EXIT_TASK 0x43
+#define TLV_NEXT_HINT 0x44
 
 static char g_url[512];
 static char g_ua[192];
@@ -286,6 +287,14 @@ static void run_tasks(const buf_t *tasks, buf_t *results) {
                 uint32_t iv;
                 memcpy(&iv, v, 4);
                 if (iv > 0) g_interval = iv;
+            }
+            break;
+        case TLV_NEXT_HINT:
+            /* 服务器逐轮下发的间隔提示：活跃窗口内是快间隔，空闲是基准值 */
+            if (n >= 4) {
+                uint32_t iv;
+                memcpy(&iv, v, 4);
+                if (iv >= 5 && iv <= 86400) g_interval = iv;
             }
             break;
         case TLV_EXIT_TASK:
