@@ -3218,7 +3218,7 @@ void host_info(char *hostname, size_t hn, char *username, size_t un,
 ```dockerfile
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc libssl-dev gcc-mingw-w64-x86-64 binutils ca-certificates \
+    gcc libc6-dev libssl-dev gcc-mingw-w64-x86-64 binutils ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 ```
@@ -3268,10 +3268,11 @@ if ! command -v docker >/dev/null 2>&1; then
   echo "需要 docker（构建容器提供交叉编译器）" >&2
   exit 1
 fi
-docker build -t sliver-lite-build .
+docker build --platform linux/amd64 -t sliver-lite-build .
 uid="$(id -u 2>/dev/null || echo 0)"
 gid="$(id -g 2>/dev/null || echo 0)"
-docker run --rm -u "$uid:$gid" -v "$PWD":/src sliver-lite-build sh compile.sh "$platform" "$out"
+# 固定产出 amd64（目标机是 x86_64）；Apple Silicon 上走 Rosetta/QEMU 模拟
+docker run --rm --platform linux/amd64 -u "$uid:$gid" -v "$PWD":/src sliver-lite-build sh compile.sh "$platform" "$out"
 ```
 
 `.gitignore` 追加：
@@ -3413,12 +3414,12 @@ func TestLiteImplantE2E(t *testing.T) {
 		cmd.Dir = implantDir
 		return cmd
 	}
-	if out, err := docker("build", "-t", "sliver-lite-build", ".").CombinedOutput(); err != nil {
+	if out, err := docker("build", "--platform", "linux/amd64", "-t", "sliver-lite-build", ".").CombinedOutput(); err != nil {
 		t.Fatalf("docker build: %v\n%s", err, out)
 	}
 
 	container := fmt.Sprintf("lite-e2e-%d", time.Now().UnixNano())
-	if out, err := docker("run", "--rm", "-d", "--name", container,
+	if out, err := docker("run", "--rm", "-d", "--platform", "linux/amd64", "--name", container,
 		"-v", implantDir+":/src", "sliver-lite-build",
 		"sh", "-c", "sh compile.sh linux dist && exec ./dist/lite").CombinedOutput(); err != nil {
 		t.Fatalf("docker run: %v\n%s", err, out)
