@@ -30,8 +30,8 @@ const (
 	TaskExit  byte = 0x43
 )
 
-// maxTLVValueSize bounds a single TLV value: 512KiB file content + framing.
-const maxTLVValueSize = 768 * 1024
+// Wire length field is u16; every emitted value must stay below 65535.
+// The 60KB content caps (see port.h) keep all payloads well inside the limit.
 
 type tlv struct {
 	Type  byte
@@ -60,9 +60,6 @@ func decodeTLVs(data []byte) ([]tlv, error) {
 			return nil, errors.New("truncated tlv header")
 		}
 		n := int(binary.LittleEndian.Uint16(data[1:3]))
-		if n > maxTLVValueSize {
-			return nil, fmt.Errorf("oversized tlv value for type %#x", data[0])
-		}
 		if len(data) < 3+n {
 			return nil, errors.New("truncated tlv value")
 		}
@@ -198,6 +195,9 @@ func buildTaskPayload(tasks []Task, padLen int) ([]byte, error) {
 		case TaskExit:
 		default:
 			return nil, fmt.Errorf("unknown task type %#x", t.Type)
+		}
+		if len(value) > 0xFFFF {
+			return nil, fmt.Errorf("task %#x value exceeds u16 tlv length", t.Type)
 		}
 		items = append(items, tlv{Type: t.Type, Value: value})
 	}

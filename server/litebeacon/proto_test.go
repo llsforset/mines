@@ -3,6 +3,7 @@ package litebeacon
 import (
 	"bytes"
 	"encoding/binary"
+	"strings"
 	"testing"
 )
 
@@ -31,8 +32,16 @@ func TestDecodeTLVsRejectsTruncation(t *testing.T) {
 	if _, err := decodeTLVs([]byte{0x01, 0x05, 0x00, 'a'}); err == nil {
 		t.Fatal("expected truncation error")
 	}
+	// declared 0xFF00 bytes but only 1 present — also truncation
 	if _, err := decodeTLVs([]byte{0x01, 0x00, 0xFF, 'a'}); err == nil {
-		t.Fatal("expected oversized value error")
+		t.Fatal("expected truncation error")
+	}
+}
+
+func TestBuildTaskPayloadRejectsOversizeValue(t *testing.T) {
+	long := strings.Repeat("a", 0xFFFF+1)
+	if _, err := buildTaskPayload([]Task{{ID: 1, Type: TaskExec, Cmd: long, TimeoutSec: 1}}, 0); err == nil {
+		t.Fatal("expected oversize rejection")
 	}
 }
 
