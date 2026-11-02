@@ -698,7 +698,7 @@ func TestTouchUpsertsAndDetectsReplay(t *testing.T) {
 	if s.Touch("abc", []byte("nonce-1"), info, "aa", now) {
 		t.Fatal("first touch must not be a replay")
 	}
-	if s.Touch("abc", []byte("nonce-1"), nil, "aa", now) {
+	if !s.Touch("abc", []byte("nonce-1"), nil, "aa", now) {
 		t.Fatal("same nonce must be flagged as replay")
 	}
 	if s.Touch("abc", []byte("nonce-2"), nil, "aa", now) {
