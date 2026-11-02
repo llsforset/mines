@@ -112,8 +112,8 @@ plaintext = TLV 帧序列：[type:1B][len:2B LE][value:lenB] 串接
 | 0x12 | arch | 字符串 |
 | 0x13 | username | 字符串 |
 | 0x14 | pid | uint32 |
-| 0x20 | exec 结果 | [task_id u32][exit i32][output ≤64KB] |
-| 0x30 | 文件结果 | [task_id u32][err u8][content ≤512KB] |
+| 0x20 | exec 结果 | [task_id u32][exit i32][output ≤60KB] |
+| 0x30 | 文件结果 | [task_id u32][err u8][content ≤60KB] |
 
 下行（服务器 → 植入体，任务队列逐个下发）：
 
@@ -200,7 +200,9 @@ Dockerfile debian 构建 env：gcc + libssl-dev + gcc-mingw-w64-x86-64 + binutil
   作为结果回传；文件读取失败回 err 码（1=不存在 2=拒绝 3=超大）。
 - 服务端：解密失败/未知信标一律 404；队列满丢弃最旧任务并记录日志；
   结果缓冲超限丢最旧。
-- 命令输出上限 64KB，文件内容上限 512KB，超限截断并在 TLV err 位标注。
+- 命令输出上限 60KB（超限截断）；文件内容上限 60KB（超限回 err=3，
+  不截断）。上限刻意低于 TLV u16 长度字段极限（65535），避免单帧溢出，
+  也避免巨型加密 POST 暴露流量外形。更大的文件应拆成多条任务。
 
 ## 6. 测试计划
 
