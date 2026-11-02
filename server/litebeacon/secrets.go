@@ -58,8 +58,10 @@ func (r *SecretRegistry) Issue(label string) (SecretEntry, error) {
 		CreatedAt: time.Now().UTC(),
 		Label:     label,
 	}
+	before := len(r.entries)
 	r.entries = append(r.entries, entry)
 	if err := r.save(); err != nil {
+		r.entries = r.entries[:before] // 落盘失败回滚，避免内存里残留未持久化的幽灵密钥
 		return SecretEntry{}, err
 	}
 	return entry, nil

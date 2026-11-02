@@ -691,7 +691,12 @@ async function renderLite(view) {
     } catch (err) { $("lite-results").textContent = err.message; }
   };
   view.querySelectorAll("[data-del]").forEach((button) => button.onclick = async () => {
-    await api("/api/lite/beacon/delete", { method: "POST", json: { id: button.dataset.del } });
+    try {
+      await api("/api/lite/beacon/delete", { method: "POST", json: { id: button.dataset.del } });
+    } catch (err) {
+      $("lite-note").textContent = "删除失败：" + err.message;
+      return;
+    }
     render();
   });
 }

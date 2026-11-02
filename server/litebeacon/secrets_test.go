@@ -50,6 +50,32 @@ func TestIssueAppendsAndPersists(t *testing.T) {
 	}
 }
 
+func TestIssueRollsBackOnSaveFailure(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("permission-based failure injection doesn't work as root")
+	}
+	path := filepath.Join(t.TempDir(), "secrets.json")
+	reg, err := LoadSecrets(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _ := reg.Latest()
+	if err := os.Chmod(path, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+	if _, err := reg.Issue("doomed"); err == nil {
+		t.Fatal("expected save failure")
+	}
+	if got := reg.List(); len(got) != 1 {
+		t.Fatalf("ghost entry survived rollback: %#v", got)
+	}
+	again, _ := reg.Latest()
+	if again.SecretB64 != first.SecretB64 {
+		t.Fatal("latest changed after failed issue")
+	}
+}
+
 func TestSecretB64DecodesTo32Bytes(t *testing.T) {
 	reg, err := LoadSecrets(filepath.Join(t.TempDir(), "secrets.json"))
 	if err != nil {

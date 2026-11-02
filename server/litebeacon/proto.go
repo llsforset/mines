@@ -30,7 +30,7 @@ const (
 	TaskExit  byte = 0x43
 )
 
-// Wire length field is u16; every emitted value must stay below 65535.
+// Wire length field is u16; every emitted value must fit in it (at most 65535).
 // The 60KB content caps (see port.h) keep all payloads well inside the limit.
 
 type tlv struct {
