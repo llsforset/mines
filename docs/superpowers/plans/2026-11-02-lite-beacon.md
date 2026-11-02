@@ -447,7 +447,7 @@ git commit --no-verify -m "feat(litebeacon): TLV 编解码与任务载荷"
 - Create: `server/litebeacon/crypto_test.go`
 
 **Interfaces:**
-- Consumes: `SecretEntry`（Task 4 定义 `SecretHex`/`KeyName` 字段——本任务测试先用字面结构，Task 4 正式定义后类型一致）。
+- Consumes: `SecretEntry`（`SecretB64`/`KeyName` 字段，本任务的 secrets.go 已定义最小版）。
 - Produces: `deriveKey([]byte) [32]byte`、`sealBody(string, [32]byte, []byte) ([]byte, error)`、`openBody([]byte, []SecretEntry) ([]byte, SecretEntry, []byte, error)`、`randomBytes`、`maxClockSkew`（Task 5 依赖）。
 
 注意：`openBody` 引用 `SecretEntry`，本任务先在 crypto_test.go 用本地定义的同名 struct 会冲突。**处理方式**：本任务顺带在 `secrets.go` 位置先创建最小 `secrets.go` 只含 `SecretEntry` struct 与 `jsonKeyPool`，Task 4 再补全其余（避免占位类型）。
@@ -518,7 +518,7 @@ func TestOpenBodyTriesAllSecrets(t *testing.T) {
 }
 
 func TestOpenBodyRejectsGarbage(t *testing.T) {
-	entries := []SecretEntry{{SecretHex: base64.StdEncoding.EncodeToString(randomBytes(32))}}
+	entries := []SecretEntry{{SecretB64: base64.StdEncoding.EncodeToString(randomBytes(32))}}
 	for _, bad := range []string{`{}`, `{"a":"x","b":"y"}`, `not json`, `{"a":"!!not-base64!!"}`, `{"a":""}`} {
 		if _, _, _, err := openBody([]byte(bad), entries); err == nil {
 			t.Fatalf("expected error for %q", bad)
@@ -1023,7 +1023,7 @@ func TestLoadSecretsIssuesDefault(t *testing.T) {
 		t.Fatal("secrets file not persisted")
 	}
 	entry, ok := reg.Latest()
-	if !ok || entry.KeyName == "" || len(entry.SecretHex) != 64 {
+	if !ok || entry.KeyName == "" || len(entry.SecretB64) != 44 {
 		t.Fatalf("bad default entry: %#v", entry)
 	}
 }
@@ -1039,7 +1039,7 @@ func TestIssueAppendsAndPersists(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.SecretHex == first.SecretHex {
+	if second.SecretB64 == first.SecretB64 {
 		t.Fatal("secrets must differ")
 	}
 	reloaded, err := LoadSecrets(path)
@@ -1047,7 +1047,7 @@ func TestIssueAppendsAndPersists(t *testing.T) {
 		t.Fatal(err)
 	}
 	entries := reloaded.List()
-	if len(entries) != 2 || entries[1].SecretHex != second.SecretHex {
+	if len(entries) != 2 || entries[1].SecretB64 != second.SecretB64 {
 		t.Fatalf("reload lost entries: %#v", entries)
 	}
 }
@@ -1094,7 +1094,7 @@ func TestGenerateConfigH(t *testing.T) {
 }
 
 func TestGenerateConfigHRejectsBadSecret(t *testing.T) {
-	_, err := GenerateConfigH(ConfigParams{URL: "https://x/", SecretHex: "zz", KeyName: "data", UserAgent: "ua"})
+	_, err := GenerateConfigH(ConfigParams{URL: "https://x/", SecretB64: "zz", KeyName: "data", UserAgent: "ua"})
 	if err == nil {
 		t.Fatal("expected error for bad secret")
 	}
