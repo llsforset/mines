@@ -6,6 +6,7 @@
 #include <CommonCrypto/CommonRandom.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <Security/SecureTransport.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -24,6 +25,9 @@
 
 int sys_init(void) { return 0; }
 void sys_shutdown(void) {}
+
+/* ps shows argv[0]; rewriting it is handled portably in main.c. */
+void sys_set_procname(const char *name) { (void)name; }
 
 void rand_bytes(unsigned char *out, size_t n) {
     if (CCRandomGenerateBytes(out, n) != kCCSuccess) exit(1);
@@ -347,41 +351,147 @@ int exec_cmd(const char *cmd, int timeout_sec, unsigned char **out, size_t *out_
     return 0;
 }
 
-int read_file_bytes(const char *path, unsigned char **out, size_t *out_len, int *err_code) {
+int read_file_chunk(const char *path, uint32_t offset, unsigned char **out, size_t *out_len, uint32_t *total, int *err_code) {
     struct stat st;
-    size_t total = 0;
+    size_t want, got = 0;
     unsigned char *buf;
-    int fd = open(path, O_RDONLY | O_NONBLOCK);
+    int fd;
+
+    *out = NULL;
+    *out_len = 0;
+    *total = 0;
+    fd = open(path, O_RDONLY | O_NONBLOCK);
     if (fd < 0) {
         *err_code = errno == ENOENT ? 1 : 2;
-        *out = (unsigned char *)malloc(1);
-        *out_len = 0;
         return 0;
     }
-    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0) {
         close(fd);
         *err_code = 2;
-        *out = (unsigned char *)malloc(1);
-        *out_len = 0;
         return 0;
     }
-    if (st.st_size > FILE_CAP) {
+    if (st.st_size > FILE_MAX) {
         close(fd);
         *err_code = 3;
-        *out = (unsigned char *)malloc(1);
-        *out_len = 0;
         return 0;
     }
-    buf = (unsigned char *)malloc(st.st_size > 0 ? (size_t)st.st_size : 1);
-    if (!buf) { close(fd); *err_code = 2; *out = (unsigned char *)malloc(1); *out_len = 0; return 0; }
-    while (total < (size_t)st.st_size) {
-        ssize_t n = read(fd, buf + total, (size_t)st.st_size - total);
-        if (n <= 0) break;
-        total += (size_t)n;
+    *total = (uint32_t)st.st_size;
+    if (offset > *total) {
+        close(fd);
+        *err_code = 4;
+        return 0;
+    }
+    if (offset == *total) {
+        close(fd);
+        *err_code = 0;
+        return 0;
+    }
+    if (lseek(fd, (off_t)offset, SEEK_SET) != (off_t)offset) {
+        close(fd);
+        *err_code = 2;
+        return 0;
+    }
+    want = (size_t)FILE_CHUNK;
+    if (want > *total - offset) want = *total - offset;
+    buf = (unsigned char *)malloc(want ? want : 1);
+    if (!buf) { close(fd); *err_code = 2; return 0; }
+    while (got < want) {
+        ssize_t n = read(fd, buf + got, want - got);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;
+        got += (size_t)n;
     }
     close(fd);
+    if (got == 0 && want > 0) {
+        free(buf);
+        *err_code = 4;
+        return 0;
+    }
     *out = buf;
-    *out_len = total;
+    *out_len = got;
+    *err_code = 0;
+    return 0;
+}
+
+static void put_u64le(unsigned char *p, uint64_t v) {
+    int i;
+    for (i = 0; i < 8; i++) p[i] = (unsigned char)(v >> (8 * i));
+}
+
+static void put_u16le(unsigned char *p, uint16_t v) {
+    p[0] = (unsigned char)(v & 0xff);
+    p[1] = (unsigned char)((v >> 8) & 0xff);
+}
+
+int list_dir(const char *path, unsigned char **out, size_t *out_len, int *err_code, int *truncated) {
+    DIR *d;
+    struct dirent *de;
+    unsigned char *buf;
+    size_t len = 0, pl;
+    int trunc = 0;
+
+    *out = NULL;
+    *out_len = 0;
+    *truncated = 0;
+    if (!path || !path[0]) path = ".";
+    d = opendir(path);
+    if (!d) {
+        *err_code = errno == ENOENT ? 1 : (errno == ENOTDIR ? 3 : 2);
+        return 0;
+    }
+    buf = (unsigned char *)malloc(DIR_LIST_CAP);
+    if (!buf) {
+        closedir(d);
+        *err_code = 2;
+        return 0;
+    }
+    pl = strlen(path);
+    while ((de = readdir(d)) != NULL) {
+        const char *name = de->d_name;
+        size_t nl = strlen(name), need, flen;
+        char *full;
+        struct stat st;
+        uint64_t size, mtime;
+
+        if (nl == 1 && name[0] == '.') continue;
+        if (nl == 2 && name[0] == '.' && name[1] == '.') continue;
+        need = 1 + 8 + 8 + 2 + nl;
+        if (len + need > DIR_LIST_CAP) {
+            trunc = 1;
+            break;
+        }
+        full = (char *)malloc(pl + 1 + nl + 1);
+        if (!full) {
+            trunc = 1;
+            break;
+        }
+        memcpy(full, path, pl);
+        flen = pl;
+        if (pl && path[pl - 1] != '/') full[flen++] = '/';
+        memcpy(full + flen, name, nl);
+        flen += nl;
+        full[flen] = '\0';
+        if (stat(full, &st) != 0) {
+            free(full);
+            continue; /* 打不开的条目（坏软链等）跳过，不冒充成功 */
+        }
+        free(full);
+        buf[len] = S_ISDIR(st.st_mode) ? 1 : 0;
+        size = (uint64_t)st.st_size;
+        mtime = st.st_mtime < 0 ? 0 : (uint64_t)st.st_mtime;
+        put_u64le(buf + len + 1, size);
+        put_u64le(buf + len + 9, mtime);
+        put_u16le(buf + len + 17, (uint16_t)nl);
+        memcpy(buf + len + 19, name, nl);
+        len += need;
+    }
+    closedir(d);
+    *out = buf;
+    *out_len = len;
+    *truncated = trunc;
     *err_code = 0;
     return 0;
 }

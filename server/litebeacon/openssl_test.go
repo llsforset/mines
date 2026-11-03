@@ -144,7 +144,7 @@ static const unsigned char CFG_UA[1] = {0};
 #define CFG_INTERVAL 10
 `
 	for _, arch := range []string{"arm64", "amd64"} {
-		data, err := compileImplant(cfg, "linux", arch)
+		data, err := compileImplant(cfg, "linux", arch, nil, "")
 		if err != nil {
 			t.Fatalf("%s: %v", arch, err)
 		}

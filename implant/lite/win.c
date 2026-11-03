@@ -12,6 +12,9 @@
 int sys_init(void) { return 0; }
 void sys_shutdown(void) {}
 
+/* Explorer/Task Manager read the version resource compiled into the exe. */
+void sys_set_procname(const char *name) { (void)name; }
+
 void rand_bytes(unsigned char *out, size_t n) {
     typedef BOOLEAN(WINAPI * rtlgenrandom_fn)(unsigned char *, unsigned long);
     if (BCryptGenRandom(NULL, out, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0) {
@@ -351,15 +354,16 @@ finish:
     return 0;
 }
 
-int read_file_bytes(const char *path, unsigned char **out, size_t *out_len, int *err_code) {
-    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    LARGE_INTEGER size;
+int read_file_chunk(const char *path, uint32_t offset, unsigned char **out, size_t *out_len, uint32_t *total, int *err_code) {
+    HANDLE h;
+    LARGE_INTEGER size, pos;
     unsigned char *buf;
-    size_t total = 0;
+    size_t want, got = 0;
 
-    *out = (unsigned char *)malloc(1);
+    *out = NULL;
     *out_len = 0;
-    if (*out) (*out)[0] = 0;
+    *total = 0;
+    h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) {
         DWORD e = GetLastError();
         *err_code = (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) ? 1 : 2;
@@ -370,22 +374,132 @@ int read_file_bytes(const char *path, unsigned char **out, size_t *out_len, int 
         *err_code = 2;
         return 0;
     }
-    if (!GetFileSizeEx(h, &size) || size.QuadPart < 0 || size.QuadPart > FILE_CAP) {
+    if (!GetFileSizeEx(h, &size) || size.QuadPart < 0) {
+        CloseHandle(h);
+        *err_code = 2;
+        return 0;
+    }
+    if (size.QuadPart > FILE_MAX) {
         CloseHandle(h);
         *err_code = 3;
         return 0;
     }
-    buf = (unsigned char *)malloc(size.QuadPart > 0 ? (size_t)size.QuadPart : 1);
+    *total = (uint32_t)size.QuadPart;
+    if (offset > *total) {
+        CloseHandle(h);
+        *err_code = 4;
+        return 0;
+    }
+    if (offset == *total) {
+        CloseHandle(h);
+        *err_code = 0;
+        return 0;
+    }
+    pos.QuadPart = (LONGLONG)offset;
+    if (!SetFilePointerEx(h, pos, NULL, FILE_BEGIN)) {
+        CloseHandle(h);
+        *err_code = 2;
+        return 0;
+    }
+    want = (size_t)FILE_CHUNK;
+    if (want > *total - offset) want = *total - offset;
+    buf = (unsigned char *)malloc(want ? want : 1);
     if (!buf) { CloseHandle(h); *err_code = 2; return 0; }
-    while (total < (size_t)size.QuadPart) {
+    while (got < want) {
         DWORD rd = 0;
-        if (!ReadFile(h, buf + total, (DWORD)((size_t)size.QuadPart - total), &rd, NULL) || rd == 0) break;
-        total += rd;
+        if (!ReadFile(h, buf + got, (DWORD)(want - got), &rd, NULL) || rd == 0) break;
+        got += rd;
     }
     CloseHandle(h);
-    free(*out);
+    if (got == 0 && want > 0) {
+        free(buf);
+        *err_code = 4;
+        return 0;
+    }
     *out = buf;
-    *out_len = total;
+    *out_len = got;
+    *err_code = 0;
+    return 0;
+}
+
+static void put_u64le(unsigned char *p, uint64_t v) {
+    int i;
+    for (i = 0; i < 8; i++) p[i] = (unsigned char)(v >> (8 * i));
+}
+
+static void put_u16le(unsigned char *p, uint16_t v) {
+    p[0] = (unsigned char)(v & 0xff);
+    p[1] = (unsigned char)((v >> 8) & 0xff);
+}
+
+int list_dir(const char *path, unsigned char **out, size_t *out_len, int *err_code, int *truncated) {
+    char *pattern;
+    size_t pl;
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    unsigned char *buf;
+    size_t len = 0;
+    int trunc = 0;
+
+    *out = NULL;
+    *out_len = 0;
+    *truncated = 0;
+    if (!path || !path[0]) path = ".";
+    pl = strlen(path);
+    pattern = (char *)malloc(pl + 3);
+    if (!pattern) {
+        *err_code = 2;
+        return 0;
+    }
+    memcpy(pattern, path, pl);
+    if (pl && path[pl - 1] != '\\') pattern[pl++] = '\\';
+    pattern[pl++] = '*';
+    pattern[pl] = '\0';
+
+    h = FindFirstFileA(pattern, &fd);
+    free(pattern);
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD e = GetLastError();
+        *err_code = (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) ? 1
+                  : (e == ERROR_DIRECTORY ? 3 : 2);
+        return 0;
+    }
+    buf = (unsigned char *)malloc(DIR_LIST_CAP);
+    if (!buf) {
+        FindClose(h);
+        *err_code = 2;
+        return 0;
+    }
+    do {
+        const char *name = fd.cFileName;
+        size_t nl = strlen(name), need;
+        uint64_t size, mtime;
+        ULARGE_INTEGER ft;
+
+        if (nl == 1 && name[0] == '.') continue;
+        if (nl == 2 && name[0] == '.' && name[1] == '.') continue;
+        need = 1 + 8 + 8 + 2 + nl;
+        if (len + need > DIR_LIST_CAP) {
+            trunc = 1;
+            break;
+        }
+        buf[len] = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
+        size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        ft.HighPart = fd.ftLastWriteTime.dwHighDateTime;
+        ft.LowPart = fd.ftLastWriteTime.dwLowDateTime;
+        mtime = ft.QuadPart >= 116444736000000000ULL
+                    ? (ft.QuadPart - 116444736000000000ULL) / 10000000ULL
+                    : 0;
+        put_u64le(buf + len + 1, size);
+        put_u64le(buf + len + 9, mtime);
+        put_u16le(buf + len + 17, (uint16_t)nl);
+        memcpy(buf + len + 19, name, nl);
+        len += need;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    *out = buf;
+    *out_len = len;
+    *truncated = trunc;
     *err_code = 0;
     return 0;
 }
