@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mines 控制台</title>
+  <link rel="stylesheet" href="/app.css?v=targets5">
+</head>
+<body>
+  <div id="login" class="login">
+    <form id="login-form" class="login-card">
+      <div class="mark">MINES</div>
+      <h1>登录</h1>
+      <p>使用账号和密码进入控制台。</p>
+      <label>账号<input id="username" autocomplete="username" required></label>
+      <label>密码<input id="password" type="password" autocomplete="current-password" required></label>
+      <button type="submit">进入控制台</button>
+      <p id="login-error" class="error"></p>
+    </form>
+  </div>
+  <div id="shell" class="shell hidden">
+    <aside>
+      <div class="brand"><span>MINES</span><small>控制台</small></div>
+      <nav id="nav"></nav>
+      <button id="logout" class="ghost">退出</button>
+    </aside>
+    <div class="workspace">
+      <header>
+        <div>
+          <h2 id="title">总览</h2>
+          <p id="subtitle"></p>
+        </div>
+        <div class="header-actions">
+          <span id="clock"></span>
+          <button id="refresh" class="ghost">刷新</button>
+        </div>
+      </header>
+      <main id="view"></main>
+    </div>
+  </div>
+  <script src="/commands.js"></script>
+  <script src="/app.js?v=targets5"></script>
+</body>
+</html>

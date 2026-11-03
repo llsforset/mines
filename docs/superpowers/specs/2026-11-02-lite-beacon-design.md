@@ -66,8 +66,8 @@ OpenSSL（与 curl 及大量 C/S 软件同栈）。握手指纹呈现为「普�
 POST，连接即断。间隔逐轮重算，而非固定值加小抖动：
 
 - 首连延迟 uniform(5, 30) 秒，切断「部署→立即上线」的时间关联；
-- 下一轮间隔 = base × uniform(0.5, 1.7)，另有 8% 概率再乘
-  uniform(2.0, 3.0)，让长期间隔直方图不聚簇；
+- 空闲时下一轮间隔 = base × uniform(0.5, 3)，每跳重抽，倍率不超过 3；
+  操作员活跃窗口内按 fastSec 整秒睡，不再乘浮动；
 - base 默认 180 秒，构建时可调；
 - 任务完成后的结果回传延迟 uniform(1, 4) 秒，拆开「收到任务→立刻
   回连」的强关联。
@@ -125,16 +125,16 @@ plaintext = TLV 帧序列：[type:1B][len:2B LE][value:lenB] 串接
 | 0x41 | 读文件任务 | [task_id u32][path bytes] |
 | 0x42 | 调整间隔 | [interval_sec u32][jitter_pct u8] |
 | 0x43 | 退出 | 空（植入体收到后静默退出） |
-| 0x44 | 间隔提示 | uint32 秒（5..86400，植入体超界忽略；每轮应答必带） |
+| 0x44 | 间隔提示 | uint32 秒（5..86400，植入体超界忽略）+ 1 字节 exact（1=整秒睡，0=乘 0.5~3）；每轮应答必带 |
 
 任意方向均可插入 0x0F 填充 TLV：值为随机字节（0-256B），接收方解出后
 忽略，用于消除请求/响应体长度的定长聚簇特征。
 
 **自适应回连间隔（v1.1）**：服务器每轮在 0x44 里下发植入体的下一轮
-间隔基准。策略：操作员 5 分钟内给该信标排过任务或拉过结果（活跃窗口）
-→ 下发 fastSec；否则下发该信标的基准值（sleep 任务 0x42 可设单信标
-基准，未设时为监听器空闲值 idleSec）。两档均为监听器启动参数（clamp
-5..86400），默认都是 10s；植入体仅照做 0x44，不维护本地策略。首轮
+间隔基准。策略：操作员 5 分钟内给该信标排过任务（活跃窗口）。只打开页面、轮询结果不算活跃。
+→ 下发 fastSec 且 exact=1，植入体按该秒数整秒回连；否则下发该信标的基准值且 exact=0（sleep 任务 0x42 可设单信标
+基准，未设时为监听器空闲值 idleSec），植入体再乘 uniform(0.5, 3)。两档均为监听器启动参数（clamp
+5..86400），默认都是 10s。首轮
 间隔由 config.h 的 CFG_INTERVAL（=签发时的空闲值）决定，之后完全由
 0x44 接管。纯轮询的数学极限不变：空闲期排的第一个命令最坏等待一个
 空闲间隔才被捡起。
@@ -198,13 +198,18 @@ Dockerfile debian 构建 env：gcc + libssl-dev + gcc-mingw-w64-x86-64 + binutil
 | `POST /api/lite/listener/stop` | |
 | `POST /api/lite/config` | 签发新 secret（旧 secret 保留有效），返回 url、secret（base64）、可直接保存的 config.h 文本 |
 | `GET /api/lite/config` | 返回最新 secret 与对应 config.h 文本（不新建） |
-| `GET /api/lite/beacons` | 信标列表：id/主机信息/firstSeen/lastSeen |
+| `GET /api/lite/beacons` | 信标列表：id/主机信息/firstSeen/lastSeen，以及当前心跳 IntervalSec、空闲/干活档、是否在活跃窗口、排队任务数 |
 | `POST /api/lite/task` | {beaconId, type: exec\|read, cmd\|path} → taskId |
 | `GET /api/lite/results` | ?beacon=xx 取回结果（读取即消费） |
 | `POST /api/lite/beacon/delete` | 从列表删除信标（控制台清理用，非植入体功能） |
 
-`static/app.js` 新增「轻量信标」面板：监听器启停、config.h 下发、
-信标表、任务下发表单、结果查看。样式沿用现有面板。
+控制台不把 C 植入体单独开一页。「植入体」是生成列表，选 Go 或 C：
+Go 走原来的编译表单，C 在这一页启停监听并下载 config.h。
+「已上线」是同一张表，Go 会话、Go 信标和 C 信标都在里面。
+点进 C 信标后是接近普通命令行的终端：输入命令回车即排队
+exec，结果随下次心跳带回（有延迟），顶部状态条持续显示当前心跳间隔、
+最近回连、预计下次回连。操作符命令用点号前缀（`.help` / `.sleep` /
+`.read` / `.kill`）。样式沿用现有面板。
 
 ## 5. 错误处理
 

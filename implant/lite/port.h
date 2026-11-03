@@ -7,6 +7,9 @@
 #define OUT_CAP       (60 * 1000) /* must stay under the u16 TLV length limit */
 #define FILE_CAP      (60 * 1000)
 #define RESP_MAX_BODY (2 * 1024 * 1024)
+#define WIRE_MAX      (RESP_MAX_BODY + 65536) /* headers plus a capped body */
+#define RESULT_CAP    (1024 * 1024)           /* accumulated task output held in memory */
+#define MAX_TASKS     32
 
 /* Platform hooks implemented by linux.c / win.c. */
 

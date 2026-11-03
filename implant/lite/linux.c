@@ -5,14 +5,17 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 #include <pwd.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -97,16 +100,6 @@ static int parse_url(const char *url, char *host, size_t host_sz, int *port, cha
     return 0;
 }
 
-static int has_substring(const unsigned char *hay, size_t n, const char *needle) {
-    size_t nl = strlen(needle);
-    size_t i;
-    if (n < nl) return 0;
-    for (i = 0; i + nl <= n; i++) {
-        if (memcmp(hay + i, needle, nl) == 0) return 1;
-    }
-    return 0;
-}
-
 int http_post(const char *url, const char *ua, const char *body, size_t body_len,
               long *status_code, char **resp, size_t *resp_len) {
     char host[256], path[512], portstr[8], hosthdr[280];
@@ -175,12 +168,20 @@ int http_post(const char *url, const char *ua, const char *body, size_t body_len
     if (!buf) goto done;
     for (;;) {
         int r;
+        char *grown;
+        size_t ncap, room;
+        if (len >= (size_t)WIRE_MAX) break;
         if (len + 4096 > cap) {
-            cap *= 2;
-            buf = (char *)realloc(buf, cap);
-            if (!buf) goto done;
+            ncap = cap > (size_t)WIRE_MAX / 2 ? (size_t)WIRE_MAX : cap * 2;
+            if (ncap <= len) break;
+            grown = (char *)realloc(buf, ncap);
+            if (!grown) goto done; /* buf 仍指向原块，done 里会释放 */
+            buf = grown;
+            cap = ncap;
         }
-        r = SSL_read(ssl, buf + len, (int)(cap - len));
+        room = cap - len;
+        if (room > (size_t)WIRE_MAX - len) room = (size_t)WIRE_MAX - len;
+        r = SSL_read(ssl, buf + len, (int)room);
         if (r <= 0) break;
         len += (size_t)r;
     }
@@ -222,59 +223,103 @@ done:
     free(buf);
     if (ssl) { SSL_shutdown(ssl); SSL_free(ssl); }
     if (ctx) SSL_CTX_free(ctx);
+    /* 失败记录留在队列里会一次次回连越积越多。 */
+    ERR_clear_error();
     if (sock >= 0) close(sock);
     return ret;
 }
 
-static int run_shell(const char *cmd, unsigned char **out, size_t *out_len, int *exit_code) {
-    FILE *f = popen(cmd, "r");
-    size_t cap = 8192, len = 0;
-    unsigned char *buf;
-    int rc;
-    if (!f) return -1;
-    buf = (unsigned char *)malloc(cap);
-    if (!buf) { pclose(f); return -1; }
-    for (;;) {
-        size_t r;
-        if (len == cap) {
-            if (cap >= (size_t)OUT_CAP + 1) break;
-            cap *= 2;
-            if (cap > (size_t)OUT_CAP + 1) cap = (size_t)OUT_CAP + 1;
-            buf = (unsigned char *)realloc(buf, cap);
-            if (!buf) break;
-        }
-        r = fread(buf + len, 1, cap - len, f);
-        len += r;
-        if (r == 0 || len >= (size_t)OUT_CAP) break;
+static void reap_group(pid_t pid, int *st, int *reaped) {
+    if (*reaped) return;
+    /* 已经是僵尸就直接收，避免 pid 被系统复用后 kill 到别人。 */
+    if (waitpid(pid, st, WNOHANG) == pid) {
+        *reaped = 1;
+        return;
     }
-    rc = pclose(f);
-    if (WIFEXITED(rc)) *exit_code = WEXITSTATUS(rc);
-    else if (WIFSIGNALED(rc)) *exit_code = 128 + WTERMSIG(rc);
-    else *exit_code = -1;
-    *out = buf;
-    *out_len = len;
-    return 0;
+    if (kill(-pid, SIGKILL) != 0) kill(pid, SIGKILL);
+    while (waitpid(pid, st, 0) < 0 && errno == EINTR) {}
+    *reaped = 1;
 }
 
 int exec_cmd(const char *cmd, int timeout_sec, unsigned char **out, size_t *out_len, int *exit_code) {
-    char *full = (char *)malloc(strlen(cmd) + 64);
-    if (!full) return -1;
+    int fds[2], st = 0, reaped = 0;
+    pid_t pid;
+    unsigned char *buf;
+    size_t cap = 8192, len = 0;
+    time_t deadline;
+
     if (timeout_sec <= 0 || timeout_sec > 600) timeout_sec = 30;
-    sprintf(full, "timeout %d %s 2>&1", timeout_sec, cmd);
-    if (run_shell(full, out, out_len, exit_code) != 0) {
-        free(full);
+    if (pipe(fds) != 0) return -1;
+    pid = fork();
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
         return -1;
     }
-    if (*exit_code == 127 && has_substring(*out, *out_len, "not found") &&
-        has_substring(*out, *out_len, "timeout")) {
-        /* no coreutils timeout(1) on this box — run without the wrapper */
-        free(*out);
-        *out = NULL;
-        *out_len = 0;
-        sprintf(full, "%s 2>&1", cmd);
-        run_shell(full, out, out_len, exit_code);
+    if (pid == 0) {
+        setpgid(0, 0);
+        dup2(fds[1], 1);
+        dup2(fds[1], 2);
+        close(fds[0]);
+        close(fds[1]);
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
     }
-    free(full);
+    setpgid(pid, pid);
+    close(fds[1]);
+    fcntl(fds[0], F_SETFL, O_NONBLOCK);
+    buf = (unsigned char *)malloc(cap);
+    deadline = time(NULL) + timeout_sec;
+    while (buf && len < (size_t)OUT_CAP && time(NULL) < deadline) {
+        ssize_t n;
+        if (len == cap) {
+            size_t ncap = cap * 2;
+            unsigned char *grown;
+            if (ncap > (size_t)OUT_CAP + 1) ncap = (size_t)OUT_CAP + 1;
+            if (ncap <= cap) break;
+            grown = (unsigned char *)realloc(buf, ncap);
+            if (!grown) break;
+            buf = grown;
+            cap = ncap;
+        }
+        n = read(fds[0], buf + len, cap - len);
+        if (n > 0) {
+            len += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            fd_set rfds;
+            struct timeval tv;
+            pid_t wr = waitpid(pid, &st, WNOHANG);
+            if (wr == pid) reaped = 1;
+            if (reaped) break;
+            FD_ZERO(&rfds);
+            FD_SET(fds[0], &rfds);
+            tv.tv_sec = 1;
+            tv.tv_usec = 0;
+            if (select(fds[0] + 1, &rfds, NULL, NULL, &tv) < 0 && errno != EINTR) break;
+            continue;
+        }
+        break; /* EOF or hard read error */
+    }
+    /* 子进程退出和最后一块输出之间有空隙，关管道前再抽干。 */
+    while (buf && len < (size_t)OUT_CAP) {
+        ssize_t n;
+        if (len == cap) break;
+        n = read(fds[0], buf + len, cap - len);
+        if (n > 0) { len += (size_t)n; continue; }
+        break;
+    }
+    /* 超时、输出到顶或读失败时先杀掉整组，再 wait，避免子进程堵在管道上变成僵尸。 */
+    reap_group(pid, &st, &reaped);
+    close(fds[0]);
+    if (!buf) return -1;
+    if (WIFEXITED(st)) *exit_code = WEXITSTATUS(st);
+    else if (WIFSIGNALED(st)) *exit_code = 128 + WTERMSIG(st);
+    else *exit_code = -1;
+    *out = buf;
+    *out_len = len > (size_t)OUT_CAP ? (size_t)OUT_CAP : len;
     return 0;
 }
 
@@ -282,14 +327,15 @@ int read_file_bytes(const char *path, unsigned char **out, size_t *out_len, int 
     struct stat st;
     size_t total = 0;
     unsigned char *buf;
-    int fd = open(path, O_RDONLY);
+    /* O_NONBLOCK：命名管道和设备不会把进程卡在 open 上。 */
+    int fd = open(path, O_RDONLY | O_NONBLOCK);
     if (fd < 0) {
         *err_code = errno == ENOENT ? 1 : 2;
         *out = (unsigned char *)malloc(1);
         *out_len = 0;
         return 0;
     }
-    if (fstat(fd, &st) != 0 || S_ISDIR(st.st_mode)) {
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
         close(fd);
         *err_code = 2; /* 目录/状态异常按“拒绝”处理，与 Windows 端一致 */
         *out = (unsigned char *)malloc(1);

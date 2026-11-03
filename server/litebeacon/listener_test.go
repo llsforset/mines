@@ -129,7 +129,7 @@ func TestListenerCamouflage(t *testing.T) {
 	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}} //nolint:gosec
 
 	// GET → nginx-style 404 page
-	resp, err := client.Get("https://" + addr + "/api/v2/sync")
+	resp, err := client.Get("https://" + addr + DefaultPath)
 	if err != nil {
 		t.Fatal(err)
 	}

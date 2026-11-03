@@ -174,7 +174,9 @@ int http_post(const char *url, const char *ua, const char *body, size_t body_len
     if (!buf) goto done;
     for (;;) {
         DWORD avail = 0;
+        if (total >= (size_t)RESP_MAX_BODY) break;
         if (!WinHttpQueryDataAvailable(request, &avail) || avail == 0) break;
+        if ((size_t)avail > (size_t)RESP_MAX_BODY - total) avail = (DWORD)((size_t)RESP_MAX_BODY - total);
         {
             char *grown = (char *)realloc(buf, total + avail);
             if (!grown) break;
@@ -207,9 +209,14 @@ done:
     return -1;
 }
 
+static void stop_tree(HANDLE job, HANDLE process) {
+    if (job) TerminateJobObject(job, 1);
+    else if (process) TerminateProcess(process, 1);
+}
+
 int exec_cmd(const char *cmd, int timeout_sec, unsigned char **out, size_t *out_len, int *exit_code) {
     SECURITY_ATTRIBUTES sa;
-    HANDLE rd = NULL, wr = NULL;
+    HANDLE rd = NULL, wr = NULL, job = NULL;
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
     char *cmdline = (char *)malloc(strlen(cmd) + 32);
@@ -221,7 +228,21 @@ int exec_cmd(const char *cmd, int timeout_sec, unsigned char **out, size_t *out_
     *out = (unsigned char *)malloc(1);
     *out_len = 0;
     if (*out) (*out)[0] = 0;
-    if (!cmdline || !buf) { free(cmdline); return 0; }
+    if (!cmdline || !buf) {
+        free(cmdline);
+        free(buf);
+        return 0;
+    }
+    job = CreateJobObjectA(NULL, NULL);
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli;
+        ZeroMemory(&jeli, sizeof jeli);
+        jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof jeli)) {
+            CloseHandle(job);
+            job = NULL;
+        }
+    }
     if (timeout_sec <= 0 || timeout_sec > 600) timeout_sec = 30;
     sprintf(cmdline, "cmd.exe /c %s", cmd);
 
@@ -229,9 +250,11 @@ int exec_cmd(const char *cmd, int timeout_sec, unsigned char **out, size_t *out_
     sa.lpSecurityDescriptor = NULL;
     sa.bInheritHandle = TRUE;
     if (!CreatePipe(&rd, &wr, &sa, 0)) {
-        CloseHandle(rd);
-        CloseHandle(wr);
+        if (rd) CloseHandle(rd);
+        if (wr) CloseHandle(wr);
         free(cmdline);
+        free(buf);
+        if (job) CloseHandle(job);
         return 0;
     }
     SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
@@ -248,7 +271,13 @@ int exec_cmd(const char *cmd, int timeout_sec, unsigned char **out, size_t *out_
         CloseHandle(rd);
         CloseHandle(wr);
         free(cmdline);
+        free(buf);
+        if (job) CloseHandle(job);
         return 0;
+    }
+    if (job && !AssignProcessToJobObject(job, pi.hProcess)) {
+        CloseHandle(job);
+        job = NULL;
     }
     CloseHandle(wr); /* parent copy must be gone to observe EOF */
     deadline = GetTickCount64() + (ULONGLONG)timeout_sec * 1000;
@@ -257,29 +286,45 @@ int exec_cmd(const char *cmd, int timeout_sec, unsigned char **out, size_t *out_
         DWORD avail = 0, read_n = 0;
         if (!PeekNamedPipe(rd, NULL, 0, NULL, &avail, NULL)) break;
         if (avail > 0) {
-            if (len + avail > cap) {
-                char *grown;
-                while (len + avail > cap) cap *= 2;
-                if (cap > (size_t)OUT_CAP + 1) cap = (size_t)OUT_CAP + 1;
-                grown = (char *)realloc(buf, cap);
+            char *grown;
+            size_t ncap;
+            if (len >= (size_t)OUT_CAP) { stop_tree(job, pi.hProcess); break; }
+            if ((size_t)avail > (size_t)OUT_CAP - len) avail = (DWORD)((size_t)OUT_CAP - len);
+            ncap = cap;
+            while (ncap < len + avail) {
+                if (ncap > (size_t)OUT_CAP / 2) { ncap = (size_t)OUT_CAP + 1; break; }
+                ncap *= 2;
+            }
+            if (ncap > cap) {
+                grown = (char *)realloc(buf, ncap);
                 if (!grown) break;
                 buf = (unsigned char *)grown;
+                cap = ncap;
             }
+            if (cap <= len) { stop_tree(job, pi.hProcess); break; }
             if (!ReadFile(rd, buf + len, (DWORD)(cap - len), &read_n, NULL)) break;
             len += read_n;
-            if (len >= (size_t)OUT_CAP) { TerminateProcess(pi.hProcess, 1); break; }
+            if (len >= (size_t)OUT_CAP) { stop_tree(job, pi.hProcess); break; }
             continue;
         }
         if (WaitForSingleObject(pi.hProcess, 100) == WAIT_OBJECT_0) {
             for (;;) { /* drain leftovers */
                 DWORD a2 = 0;
                 if (!PeekNamedPipe(rd, NULL, 0, NULL, &a2, NULL) || a2 == 0) break;
+                if (len >= (size_t)OUT_CAP) break;
                 if (len + a2 > cap) {
                     char *grown;
-                    while (len + a2 > cap) cap *= 2;
-                    grown = (char *)realloc(buf, cap);
+                    size_t ncap = cap;
+                    while (len + a2 > ncap) {
+                        if (ncap > (size_t)OUT_CAP) break;
+                        ncap *= 2;
+                    }
+                    if (ncap > (size_t)OUT_CAP + 1) ncap = (size_t)OUT_CAP + 1;
+                    if (ncap <= cap) break;
+                    grown = (char *)realloc(buf, ncap);
                     if (!grown) goto finish;
                     buf = (unsigned char *)grown;
+                    cap = ncap;
                 }
                 if (!ReadFile(rd, buf + len, (DWORD)(cap - len), &read_n, NULL) || read_n == 0) break;
                 len += read_n;
@@ -287,7 +332,7 @@ int exec_cmd(const char *cmd, int timeout_sec, unsigned char **out, size_t *out_
             }
             break;
         }
-        if (GetTickCount64() >= deadline) { TerminateProcess(pi.hProcess, 1); break; }
+        if (GetTickCount64() >= deadline) { stop_tree(job, pi.hProcess); break; }
     }
 finish:
     WaitForSingleObject(pi.hProcess, 5000);
@@ -298,6 +343,7 @@ finish:
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     CloseHandle(rd);
+    if (job) CloseHandle(job);
     free(cmdline);
     free(*out);
     *out = buf;
@@ -319,7 +365,12 @@ int read_file_bytes(const char *path, unsigned char **out, size_t *out_len, int 
         *err_code = (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) ? 1 : 2;
         return 0;
     }
-    if (!GetFileSizeEx(h, &size) || size.QuadPart > FILE_CAP) {
+    if (GetFileType(h) != FILE_TYPE_DISK) {
+        CloseHandle(h);
+        *err_code = 2;
+        return 0;
+    }
+    if (!GetFileSizeEx(h, &size) || size.QuadPart < 0 || size.QuadPart > FILE_CAP) {
         CloseHandle(h);
         *err_code = 3;
         return 0;

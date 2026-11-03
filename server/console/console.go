@@ -34,11 +34,15 @@ import (
 	clienttransport "github.com/bishopfox/sliver/client/transport"
 	"github.com/bishopfox/sliver/protobuf/rpcpb"
 	"github.com/bishopfox/sliver/server/transport"
+	"github.com/bishopfox/sliver/server/web"
 	"google.golang.org/grpc"
 )
 
 // Start - Starts the server console
 func Start(rcScript string) error {
+	if err := web.Start(); err != nil {
+		fmt.Printf("[!] Web console failed to start: %s\n", err)
+	}
 	_, ln, err := transport.LocalListener()
 	if err != nil {
 		return fmt.Errorf("start local listener: %w", err)

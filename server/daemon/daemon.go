@@ -28,6 +28,7 @@ import (
 	"github.com/bishopfox/sliver/server/configs"
 	"github.com/bishopfox/sliver/server/log"
 	"github.com/bishopfox/sliver/server/transport"
+	"github.com/bishopfox/sliver/server/web"
 )
 
 var (
@@ -70,6 +71,11 @@ func Start(host string, port uint16, tailscale bool, enableWG bool) {
 		fmt.Printf("[*] If you want to use the daemon mode kill the multiplayer job and try to start the daemon again.\n")
 		daemonLog.Errorf("Error starting client listener %s", err)
 		os.Exit(1)
+	}
+
+	if err = web.Start(); err != nil {
+		fmt.Printf("[!] Web console failed to start: %s\n", err)
+		daemonLog.Errorf("Web console failed to start: %s", err)
 	}
 
 	done := make(chan bool)

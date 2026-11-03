@@ -834,8 +834,14 @@ func renderSliverGoCode(name string, build *clientpb.ImplantBuild, config *clien
 
 	sliversDir := GetSliversDir() // ~/.sliver/slivers
 	projectGoPathDir := filepath.Join(sliversDir, config.GOOS, config.GOARCH, filepath.Base(name))
-	if _, err := os.Stat(projectGoPathDir); os.IsNotExist(err) {
-		os.MkdirAll(projectGoPathDir, 0700)
+	// A repeated build of the same name leaves the rewritten source tree in place.
+	// The next render copies the original tree back and then fails when the rename
+	// target, such as runc/cgroup, already exists.
+	if err := os.RemoveAll(projectGoPathDir); err != nil {
+		return "", fmt.Errorf("clean previous build dir: %w", err)
+	}
+	if err := os.MkdirAll(projectGoPathDir, 0700); err != nil {
+		return "", err
 	}
 	goConfig.ProjectDir = projectGoPathDir
 

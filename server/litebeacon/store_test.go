@@ -131,18 +131,44 @@ func TestIntervalPolicy(t *testing.T) {
 	if got := s.NextInterval("abc"); got != 10 {
 		t.Fatalf("active window should use fast value, got %d", got)
 	}
-	// 拉结果也续活跃
-	s.PushResults("abc", []ExecResult{{TaskID: 1, Output: []byte("x")}}, nil, now)
-	if got := s.NextInterval("abc"); got != 10 {
-		t.Fatalf("results fetch should keep active, got %d", got)
+	if sec, exact := s.IntervalHint("abc"); sec != 10 || !exact {
+		t.Fatalf("active window should be an exact sleep, sec=%d exact=%v", sec, exact)
 	}
-	// 活跃窗口过期 → 回到基准值
+	// 页面轮询拉结果不算干活，不能把活跃窗口续上
+	s.PushResults("abc", []ExecResult{{TaskID: 1, Output: []byte("x")}}, nil, now)
+	s.TakeResults("abc")
 	now = now.Add(6 * time.Minute)
 	if got := s.NextInterval("abc"); got != 180 {
-		t.Fatalf("expired window should fall back to base, got %d", got)
+		t.Fatalf("result polling must not extend the active window, got %d", got)
+	}
+	if sec, exact := s.IntervalHint("abc"); sec != 180 || exact {
+		t.Fatalf("idle hint should jitter, sec=%d exact=%v", sec, exact)
 	}
 	// 未见过的新信标 → 策略空闲值
 	if got := s.NextInterval("unknown"); got != 60 {
 		t.Fatalf("unknown beacon should use idle policy, got %d", got)
+	}
+}
+
+func TestListBeaconsHeartbeat(t *testing.T) {
+	s := NewStore()
+	s.SetIntervalPolicy(60, 10)
+	now := time.Now()
+	s.nowFn = func() time.Time { return now }
+	s.Touch("abc", []byte("n1"), &BeaconInfo{Hostname: "web01", Username: "root"}, "", now)
+
+	got := s.ListBeacons()
+	if len(got) != 1 {
+		t.Fatalf("want 1 beacon, got %#v", got)
+	}
+	b := got[0]
+	if b.IntervalSec != 60 || b.IdleSec != 60 || b.FastSec != 10 || b.Active || b.Queued != 0 {
+		t.Fatalf("idle list fields: %#v", b)
+	}
+
+	s.QueueTask("abc", Task{Type: TaskExec, Cmd: "id"})
+	b = s.ListBeacons()[0]
+	if !b.Active || b.IntervalSec != 10 || b.Queued != 1 {
+		t.Fatalf("active list fields: %#v", b)
 	}
 }

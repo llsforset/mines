@@ -50,7 +50,7 @@ func TestBuildCheckinResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp := buildCheckinResponse(tasks, 10, 7)
+	resp := buildCheckinResponse(tasks, 10, true, 7)
 	items, err := decodeTLVs(resp)
 	if err != nil {
 		t.Fatal(err)
@@ -65,7 +65,7 @@ func TestBuildCheckinResponse(t *testing.T) {
 			pad = &items[i]
 		}
 	}
-	if hint == nil || len(hint.Value) != 4 || binary.LittleEndian.Uint32(hint.Value) != 10 {
+	if hint == nil || len(hint.Value) != 5 || binary.LittleEndian.Uint32(hint.Value[:4]) != 10 || hint.Value[4] != 1 {
 		t.Fatalf("missing/bad interval hint: %#v", hint)
 	}
 	if pad == nil || len(pad.Value) != 7 {

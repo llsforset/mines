@@ -344,6 +344,22 @@ func (con *SliverClient) runCommandScript(serverCmds, sliverCmds console.Command
 	return nil
 }
 
+// SetOutput sends subsequent console prints to w. A nil writer restores stdout.
+func (con *SliverClient) SetOutput(w io.Writer) {
+	if w == nil {
+		con.printf = fmt.Printf
+		return
+	}
+	con.printf = func(format string, args ...any) (int, error) {
+		return fmt.Fprintf(w, format, args...)
+	}
+}
+
+// RunLine executes one console line on the active menu.
+func (con *SliverClient) RunLine(line string) error {
+	return con.runCommandLine(con.serverCmds, con.sliverCmds, line)
+}
+
 func (con *SliverClient) runCommandLine(serverCmds, sliverCmds console.Commands, line string) error {
 	args, err := shellquote.Split(line)
 	if err != nil {
