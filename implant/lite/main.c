@@ -21,12 +21,18 @@
 #define TLV_EXEC_RES  0x20
 #define TLV_FILE_RES  0x30
 #define TLV_DIR_RES   0x31
+#define TLV_STATUS_RES 0x32
 #define TLV_EXEC_TASK 0x40
 #define TLV_READ_TASK 0x41
 #define TLV_SLEEP_TASK 0x42
 #define TLV_EXIT_TASK 0x43
 #define TLV_NEXT_HINT 0x44
+/* 0x44 是心跳提示的 TLV 类型，列目录/文件操作任务从 0x45 起 */
 #define TLV_LIST_TASK 0x45
+#define TLV_WRITE_TASK 0x46
+#define TLV_RM_TASK   0x47
+#define TLV_MV_TASK   0x48
+#define TLV_MKDIR_TASK 0x49
 
 static char g_url[512];
 static char g_ua[192];
@@ -287,8 +293,31 @@ static void do_list_task(uint32_t task_id, const char *path, buf_t *results) {
     free(out);
 }
 
+/* fs 操作统一回 [task_id:4][err:1][msglen:2][msg]；msg 目前恒为空，错误码交给服务端翻译。 */
+static void emit_status(buf_t *results, uint32_t task_id, int err_code) {
+    unsigned char eb, zl[2] = {0, 0};
+    buf_t val = {0, 0, 0};
+    eb = (unsigned char)err_code;
+    buf_raw(&val, &task_id, 4);
+    buf_raw(&val, &eb, 1);
+    buf_raw(&val, zl, 2);
+    buf_tlv(results, TLV_STATUS_RES, val.data ? val.data : (const unsigned char *)"", val.len);
+    free(val.data);
+}
+
+/* 分块写入：首块做冲突校验并建临时文件，末块套原权限后原子改名。 */
+static void do_write_task(uint32_t task_id, const char *path, uint32_t offset, uint64_t total,
+                          int64_t expect_size, int64_t expect_mtime, int force,
+                          const unsigned char *chunk, size_t chunk_len, buf_t *results) {
+    int err_code = 0;
+    fs_write_chunk(path, offset, total, expect_size, expect_mtime, force,
+                   chunk_len ? chunk : (const unsigned char *)"", chunk_len, &err_code);
+    emit_status(results, task_id, err_code);
+}
+
 /* TLV strings are length-delimited, not NUL-terminated: copy + terminate. */
-static char *tlv_str(const unsigned char *src, size_t n) {    char *s = (char *)malloc(n + 1);
+static char *tlv_str(const unsigned char *src, size_t n) {
+    char *s = (char *)malloc(n + 1);
     if (!s) return NULL;
     memcpy(s, src, n);
     s[n] = '\0';
@@ -351,6 +380,90 @@ static void run_tasks(const buf_t *tasks, buf_t *results) {
                 path = tlv_str(v + 4, n - 4);
                 if (path) {
                     do_list_task(task_id, path, results);
+                    free(path);
+                    ran++;
+                }
+            }
+            break;
+        case TLV_WRITE_TASK:
+            /* [id:4][offset:4][total:8][expectSize:8][expectMtime:8][force:1][pathLen:2][path][chunk] */
+            if (ran >= MAX_TASKS) break;
+            if (n >= 37) {
+                uint32_t task_id, offset;
+                uint64_t total;
+                int64_t expect_size, expect_mtime;
+                size_t plen, hdr = 35;
+                int force;
+                char *path;
+                memcpy(&task_id, v, 4);
+                memcpy(&offset, v + 4, 4);
+                memcpy(&total, v + 8, 8);
+                memcpy(&expect_size, v + 16, 8);
+                memcpy(&expect_mtime, v + 24, 8);
+                force = v[32] != 0;
+                plen = (size_t)v[33] | ((size_t)v[34] << 8);
+                if (n >= hdr + plen) {
+                    path = tlv_str(v + hdr, plen);
+                    if (path) {
+                        do_write_task(task_id, path, offset, total, expect_size,
+                                      expect_mtime, force, v + hdr + plen, n - hdr - plen, results);
+                        free(path);
+                        ran++;
+                    }
+                }
+            }
+            break;
+        case TLV_RM_TASK:
+            /* [id:4][recursive:1][path] */
+            if (ran >= MAX_TASKS) break;
+            if (n >= 5) {
+                uint32_t task_id;
+                char *path;
+                int recursive = v[4] != 0, err = 2;
+                memcpy(&task_id, v, 4);
+                path = tlv_str(v + 5, n - 5);
+                if (path) {
+                    fs_rm(path, recursive, &err);
+                    emit_status(results, task_id, err);
+                    free(path);
+                    ran++;
+                }
+            }
+            break;
+        case TLV_MV_TASK:
+            /* [id:4][srcLen:2][src][dst] */
+            if (ran >= MAX_TASKS) break;
+            if (n >= 6) {
+                uint32_t task_id;
+                size_t slen = (size_t)v[4] | ((size_t)v[5] << 8);
+                char *src, *dst;
+                int err = 2;
+                memcpy(&task_id, v, 4);
+                if (n >= 6 + slen) {
+                    src = tlv_str(v + 6, slen);
+                    dst = tlv_str(v + 6 + slen, n - 6 - slen);
+                    if (src && dst) {
+                        fs_mv(src, dst, &err);
+                        emit_status(results, task_id, err);
+                        ran++;
+                    }
+                    free(src);
+                    free(dst);
+                }
+            }
+            break;
+        case TLV_MKDIR_TASK:
+            /* [id:4][path] */
+            if (ran >= MAX_TASKS) break;
+            if (n >= 4) {
+                uint32_t task_id;
+                char *path;
+                int err = 2;
+                memcpy(&task_id, v, 4);
+                path = tlv_str(v + 4, n - 4);
+                if (path) {
+                    fs_mkdir(path, &err);
+                    emit_status(results, task_id, err);
                     free(path);
                     ran++;
                 }

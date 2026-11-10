@@ -475,6 +475,180 @@ int list_dir(const char *path, unsigned char **out, size_t *out_len, int *err_co
     return 0;
 }
 
+static int rm_recursive(const char *path, int depth, int *err_code);
+
+int fs_rm(const char *path, int recursive, int *err_code) {
+    struct stat st;
+    if (!path || !path[0]) { *err_code = 2; return 0; }
+    if (lstat(path, &st) != 0) {
+        *err_code = errno == ENOENT ? 1 : 2;
+        return 0;
+    }
+    if (S_ISDIR(st.st_mode) && !recursive) {
+        *err_code = 6;
+        return 0;
+    }
+    if (rm_recursive(path, 32, err_code) != 0) return 0;
+    *err_code = 0;
+    return 0;
+}
+
+static int rm_recursive(const char *path, int depth, int *err_code) {
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        *err_code = errno == ENOENT ? 1 : 2;
+        return -1;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        if (unlink(path) != 0) {
+            *err_code = errno == ENOENT ? 1 : 2;
+            return -1;
+        }
+        return 0;
+    }
+    if (depth <= 0) {
+        *err_code = 2;
+        return -1;
+    }
+    DIR *d = opendir(path);
+    if (!d) {
+        *err_code = 2;
+        return -1;
+    }
+    struct dirent *de;
+    int bad = 0;
+    while ((de = readdir(d)) != NULL) {
+        const char *name = de->d_name;
+        size_t pl = strlen(path), nl = strlen(name), flen;
+        char *full;
+        int sub = 0;
+        if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) continue;
+        full = (char *)malloc(pl + 1 + nl + 1);
+        if (!full) { bad = 1; break; }
+        memcpy(full, path, pl);
+        if (pl && path[pl - 1] != '/') full[pl++] = '/';
+        memcpy(full + pl, name, nl);
+        flen = pl + nl;
+        full[flen] = '\0';
+        if (rm_recursive(full, depth - 1, &sub) != 0) bad = 1;
+        free(full);
+    }
+    closedir(d);
+    if (bad) {
+        *err_code = 2;
+        return -1;
+    }
+    if (rmdir(path) != 0) {
+        *err_code = errno == ENOENT ? 1 : 2;
+        return -1;
+    }
+    return 0;
+}
+
+int fs_mv(const char *src, const char *dst, int *err_code) {
+    if (!src || !dst || !src[0] || !dst[0]) { *err_code = 2; return 0; }
+    if (rename(src, dst) != 0) {
+        *err_code = errno == ENOENT ? 1 : 2;
+        return 0;
+    }
+    *err_code = 0;
+    return 0;
+}
+
+int fs_mkdir(const char *path, int *err_code) {
+    if (!path || !path[0]) { *err_code = 2; return 0; }
+    if (mkdir(path, 0755) != 0) {
+        *err_code = errno == EEXIST ? 5 : (errno == ENOENT ? 1 : 2);
+        return 0;
+    }
+    *err_code = 0;
+    return 0;
+}
+
+int fs_write_chunk(const char *path, uint32_t offset, uint64_t total,
+                   int64_t expect_size, int64_t expect_mtime, int force,
+                   const unsigned char *data, size_t data_len, int *err_code) {
+    struct stat st;
+    char *tmp;
+    size_t pl;
+    int fd, exists;
+
+    if (!path || !path[0]) { *err_code = 2; return 0; }
+    if (total > FILE_MAX) { *err_code = 3; return 0; }
+    pl = strlen(path);
+    tmp = (char *)malloc(pl + sizeof(WRITE_TMP));
+    if (!tmp) { *err_code = 2; return 0; }
+    memcpy(tmp, path, pl);
+    memcpy(tmp + pl, WRITE_TMP, sizeof(WRITE_TMP));
+
+    exists = stat(path, &st) == 0;
+    if (offset == 0) {
+        if (exists && !force) {
+            if (expect_size >= 0 && (uint64_t)expect_size != (uint64_t)st.st_size) {
+                free(tmp);
+                *err_code = 4;
+                return 0;
+            }
+            if (expect_mtime >= 0 && (uint64_t)expect_mtime != (uint64_t)st.st_mtime) {
+                free(tmp);
+                *err_code = 4;
+                return 0;
+            }
+        }
+        fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0) {
+            free(tmp);
+            *err_code = 2;
+            return 0;
+        }
+        close(fd);
+    }
+    fd = open(tmp, O_WRONLY);
+    if (fd < 0) {
+        free(tmp);
+        *err_code = 2;
+        return 0;
+    }
+    if (lseek(fd, (off_t)offset, SEEK_SET) != (off_t)offset) {
+        close(fd);
+        free(tmp);
+        *err_code = 2;
+        return 0;
+    }
+    {
+        size_t off = 0;
+        while (off < data_len) {
+            ssize_t w = write(fd, data + off, data_len - off);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                close(fd);
+                free(tmp);
+                *err_code = 2;
+                return 0;
+            }
+            off += (size_t)w;
+        }
+    }
+    close(fd);
+    if ((uint64_t)offset + data_len >= total) {
+        if (exists) {
+            fd = open(tmp, O_RDONLY);
+            if (fd >= 0) {
+                (void)fchmod(fd, st.st_mode & 07777);
+                close(fd);
+            }
+        }
+        if (rename(tmp, path) != 0) {
+            free(tmp);
+            *err_code = 2;
+            return 0;
+        }
+    }
+    free(tmp);
+    *err_code = 0;
+    return 0;
+}
+
 void host_info(char *hostname, size_t hn, char *username, size_t un,
                char *os, size_t on, char *arch, size_t an, uint32_t *pid) {
     struct utsname u;

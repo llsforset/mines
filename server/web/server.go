@@ -26,6 +26,27 @@ import (
 //go:embed static/*
 var staticFS embed.FS
 
+// C 下载完成后由 litebeacon 回调进来，统一落到留档目录。
+func init() {
+	litebeacon.OnCompletedFile = func(beaconID string, taskID uint32, path string, data []byte) {
+		if _, err := grabbedFiles.Save("lite:"+beaconID, path, data); err != nil {
+			filesLog.Errorf("archive downloaded file: %s", err)
+			return
+		}
+		audit.Append(AuditEntry{
+			At: time.Now(), Target: "lite:" + beaconID, Op: "download",
+			Path: path, Size: int64(len(data)),
+		})
+	}
+	// 文件写回/删除/改名/建目录：完成即记录，谁在什么时候动了什么。
+	litebeacon.OnFsResult = func(beaconID, op, path, dst string, errCode uint8, msg string) {
+		audit.Append(AuditEntry{
+			At: time.Now(), Target: "lite:" + beaconID, Op: op,
+			Path: path, Dst: dst, Err: errCode, Msg: msg,
+		})
+	}
+}
+
 var (
 	webLog    = log.NamedLogger("web", "console")
 	startOnce sync.Once
@@ -159,6 +180,11 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("/api/targets/stop", s.auth(s.targetStop))
 	mux.HandleFunc("/api/lite/task", s.auth(s.liteTask))
 	mux.HandleFunc("/api/lite/results", s.auth(s.liteResults))
+	mux.HandleFunc("/api/lite/ls", s.auth(s.liteLs))
+	mux.HandleFunc("/api/lite/fs", s.auth(s.liteFs))
+	mux.HandleFunc("/api/files", s.auth(s.filesList))
+	mux.HandleFunc("/api/files/raw", s.auth(s.filesRaw))
+	mux.HandleFunc("/api/files/audit", s.auth(s.filesAudit))
 	mux.HandleFunc("/api/upload", s.auth(s.upload))
 	mux.HandleFunc("/api/commands", s.auth(s.commandCatalog))
 	mux.HandleFunc("/api/exec", s.auth(s.exec))

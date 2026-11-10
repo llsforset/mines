@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	keyCtx       = "lite/aead/v1" // must match AEAD_CTX in implant/lite/main.c
+	keyCtx       = "lite/aead/v1" // implant stores this XOR-encoded; decoded bytes must match
 	nonceSize    = 12
 	maxClockSkew = 300 * time.Second
 )

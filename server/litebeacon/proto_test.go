@@ -84,7 +84,7 @@ func TestParseCheckin(t *testing.T) {
 		{Type: tlvUsername, Value: []byte("root")},
 		{Type: tlvPID, Value: u32b(4242)},
 		{Type: tlvExecRes, Value: append(append(u32b(7), u32b(0)...), []byte("id output")...)},
-		{Type: tlvFileRes, Value: append(append(u32b(9), 0x00), []byte("file-bytes")...)},
+		{Type: tlvFileRes, Value: fileResBytes(9, 0, 0, 10, []byte("file-bytes"))},
 	})
 	ci, err := parseCheckin(plain)
 	if err != nil {
@@ -99,8 +99,27 @@ func TestParseCheckin(t *testing.T) {
 	if len(ci.Execs) != 1 || ci.Execs[0].TaskID != 7 || ci.Execs[0].Exit != 0 || string(ci.Execs[0].Output) != "id output" {
 		t.Fatalf("bad exec result: %#v", ci.Execs)
 	}
-	if len(ci.Files) != 1 || ci.Files[0].TaskID != 9 || string(ci.Files[0].Content) != "file-bytes" {
+	if len(ci.Files) != 1 || ci.Files[0].TaskID != 9 || !ci.Files[0].Chunked ||
+		ci.Files[0].Offset != 0 || ci.Files[0].Total != 10 || string(ci.Files[0].Content) != "file-bytes" {
 		t.Fatalf("bad file result: %#v", ci.Files)
+	}
+}
+
+func TestParseChunkedFileResult(t *testing.T) {
+	ci, err := parseCheckin(encodeTLVs([]tlv{
+		{Type: tlvBeaconID, Value: []byte("0123456789abcdef")},
+		{Type: tlvTimestamp, Value: u64b(1)},
+		{Type: tlvFileRes, Value: fileResBytes(3, 0, 48000, 96000, []byte("chunk"))},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ci.Files) != 1 {
+		t.Fatalf("files: %#v", ci.Files)
+	}
+	got := ci.Files[0]
+	if !got.Chunked || got.TaskID != 3 || got.Offset != 48000 || got.Total != 96000 || string(got.Content) != "chunk" {
+		t.Fatalf("chunk: %#v", got)
 	}
 }
 
@@ -152,7 +171,8 @@ func TestBuildTaskPayload(t *testing.T) {
 	if string(items[0].Value[6:]) != "id" {
 		t.Fatalf("bad exec cmd: %q", items[0].Value[6:])
 	}
-	if items[1].Type != TaskRead || string(items[1].Value[4:]) != "/etc/hostname" {
+	if items[1].Type != TaskRead || u32(items[1].Value[0:4]) != 2 || u32(items[1].Value[4:8]) != 0 ||
+		string(items[1].Value[8:]) != "/etc/hostname" {
 		t.Fatalf("bad read task: %#v", items[1])
 	}
 	if items[2].Type != TaskSleep || u32(items[2].Value[0:4]) != 180 || items[2].Value[4] != 10 {
@@ -164,6 +184,171 @@ func TestBuildTaskPayload(t *testing.T) {
 	if items[4].Type != tlvPad || len(items[4].Value) != 5 {
 		t.Fatalf("bad pad: %#v", items[4])
 	}
+}
+
+func TestBuildTaskPayloadReadOffset(t *testing.T) {
+	payload, err := buildTaskPayload([]Task{{ID: 9, Type: TaskRead, Path: "/tmp/a", Offset: uint32(fileChunkSize)}}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items, err := decodeTLVs(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Type != TaskRead {
+		t.Fatalf("items: %#v", items)
+	}
+	if u32(items[0].Value[0:4]) != 9 || u32(items[0].Value[4:8]) != uint32(fileChunkSize) || string(items[0].Value[8:]) != "/tmp/a" {
+		t.Fatalf("read offset task: %#v", items[0])
+	}
+}
+
+func TestFileChunkFitsTLV(t *testing.T) {
+	if fileChunkSize+13 > 0xFFFF {
+		t.Fatalf("file chunk %d plus header exceeds u16 tlv", fileChunkSize)
+	}
+}
+
+func TestParseDirResult(t *testing.T) {
+	entry := func(isdir byte, size, mtime uint64, name string) []byte {
+		v := []byte{isdir}
+		v = append(v, u64b(size)...)
+		v = append(v, u64b(mtime)...)
+		v = append(v, u32b(uint32(len(name)))[0:2]...)
+		return append(v, name...)
+	}
+	value := append(u32b(7), 0)
+	value = append(value, 0) // not truncated
+	value = append(value, entry(1, 4096, 1700000000, "sub")...)
+	value = append(value, entry(0, 12, 1700000001, "a.txt")...)
+	ci, err := parseCheckin(encodeTLVs([]tlv{
+		{Type: tlvBeaconID, Value: []byte("0123456789abcdef")},
+		{Type: tlvTimestamp, Value: u64b(1)},
+		{Type: tlvDirRes, Value: value},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ci.Dirs) != 1 {
+		t.Fatalf("dirs: %#v", ci.Dirs)
+	}
+	got := ci.Dirs[0]
+	if got.TaskID != 7 || got.Err != 0 || got.Truncated || len(got.Entries) != 2 {
+		t.Fatalf("dir: %#v", got)
+	}
+	if got.Entries[0].Name != "sub" || !got.Entries[0].IsDir || got.Entries[0].Size != 4096 || got.Entries[0].ModTime != 1700000000 {
+		t.Fatalf("entry0: %#v", got.Entries[0])
+	}
+	if got.Entries[1].Name != "a.txt" || got.Entries[1].IsDir || got.Entries[1].Size != 12 {
+		t.Fatalf("entry1: %#v", got.Entries[1])
+	}
+}
+
+func TestParseDirResultErrorAndTruncatedTail(t *testing.T) {
+	// 错误结果没有条目
+	ci, err := parseCheckin(encodeTLVs([]tlv{
+		{Type: tlvBeaconID, Value: []byte("0123456789abcdef")},
+		{Type: tlvTimestamp, Value: u64b(1)},
+		{Type: tlvDirRes, Value: append(u32b(9), 2, 0)},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ci.Dirs) != 1 || ci.Dirs[0].Err != 2 || len(ci.Dirs[0].Entries) != 0 {
+		t.Fatalf("err dir: %#v", ci.Dirs)
+	}
+	// 半截条目被丢掉，不错位
+	ci, err = parseCheckin(encodeTLVs([]tlv{
+		{Type: tlvBeaconID, Value: []byte("0123456789abcdef")},
+		{Type: tlvTimestamp, Value: u64b(1)},
+		{Type: tlvDirRes, Value: append(u32b(9), 0, 0, 1, 'a', 'b')},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ci.Dirs) != 1 || len(ci.Dirs[0].Entries) != 0 {
+		t.Fatalf("partial tail: %#v", ci.Dirs)
+	}
+}
+
+func TestBuildTaskPayloadListDir(t *testing.T) {
+	payload, err := buildTaskPayload([]Task{{ID: 5, Type: TaskListDir, Path: "/var/log"}}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items, err := decodeTLVs(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Type != TaskListDir {
+		t.Fatalf("items: %#v", items)
+	}
+	if u32(items[0].Value[0:4]) != 5 || string(items[0].Value[4:]) != "/var/log" {
+		t.Fatalf("listdir task: %#v", items[0])
+	}
+}
+
+func TestBuildTaskPayloadFsOps(t *testing.T) {
+	chunk := bytes.Repeat([]byte{0xAA}, fileChunkSize)
+	payload, err := buildTaskPayload([]Task{
+		{ID: 1, Type: TaskWrite, Path: "/tmp/a b.txt", Offset: 48000, Total: 96000,
+			ExpectSize: 123, ExpectMTime: 1700000000, Force: true, Data: chunk},
+		{ID: 2, Type: TaskRm, Path: "/tmp/dir", Recursive: true},
+		{ID: 3, Type: TaskMv, Path: "/tmp/old", Dst: "/tmp/new"},
+		{ID: 4, Type: TaskMkdir, Path: "/tmp/d"},
+	}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items, err := decodeTLVs(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 4 {
+		t.Fatalf("items: %d", len(items))
+	}
+	w := items[0].Value
+	if w[32] != 1 || u32(w[0:4]) != 1 || u32(w[4:8]) != 48000 ||
+		uint64(binary.LittleEndian.Uint64(w[8:16])) != 96000 ||
+		uint64(binary.LittleEndian.Uint64(w[16:24])) != 123 ||
+		uint64(binary.LittleEndian.Uint64(w[24:32])) != 1700000000 {
+		t.Fatalf("write header: %#v", w[:33])
+	}
+	plen := int(binary.LittleEndian.Uint16(w[33:35]))
+	if string(w[35:35+plen]) != "/tmp/a b.txt" || !bytes.Equal(w[35+plen:], chunk) {
+		t.Fatal("write path/chunk")
+	}
+	if items[1].Value[4] != 1 || string(items[1].Value[5:]) != "/tmp/dir" {
+		t.Fatalf("rm: %#v", items[1])
+	}
+	sl := int(binary.LittleEndian.Uint16(items[2].Value[4:6]))
+	if string(items[2].Value[6:6+sl]) != "/tmp/old" || string(items[2].Value[6+sl:]) != "/tmp/new" {
+		t.Fatalf("mv: %#v", items[2])
+	}
+	if string(items[3].Value[4:]) != "/tmp/d" {
+		t.Fatalf("mkdir: %#v", items[3])
+	}
+}
+
+func TestParseStatusResult(t *testing.T) {
+	ci, err := parseCheckin(encodeTLVs([]tlv{
+		{Type: tlvBeaconID, Value: []byte("0123456789abcdef")},
+		{Type: tlvTimestamp, Value: u64b(1)},
+		{Type: tlvStatusRes, Value: append(u32b(11), 4, 0, 0)},
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ci.Statuses) != 1 || ci.Statuses[0].TaskID != 11 || ci.Statuses[0].Err != 4 || ci.Statuses[0].Msg != "" {
+		t.Fatalf("status: %#v", ci.Statuses)
+	}
+}
+
+func fileResBytes(id uint32, err uint8, offset, total uint32, chunk []byte) []byte {
+	v := append(u32b(id), err)
+	v = append(v, u32b(offset)...)
+	v = append(v, u32b(total)...)
+	return append(v, chunk...)
 }
 
 func u64b(v uint64) []byte {

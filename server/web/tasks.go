@@ -85,6 +85,31 @@ func (s *Service) task(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "action": body.Action})
 		return
 	}
+	// Go 目标的下载在返回给浏览器的同时落一份到留档目录，前端可以再预览。
+	if body.Action == "download" {
+		if dl, ok := msg.(*sliverpb.Download); ok && len(dl.Data) > 0 {
+			if rec, err := grabbedFiles.Save(body.Kind+":"+body.ID, dl.Path, dl.Data); err == nil {
+				audit.Append(AuditEntry{
+					At: time.Now(), Target: body.Kind + ":" + body.ID, Op: "download",
+					Path: dl.Path, Size: int64(len(dl.Data)),
+				})
+				writeJSON(w, http.StatusOK, map[string]any{
+					"Path":    dl.Path,
+					"Exists":  dl.Exists,
+					"Data":    dl.Data,
+					"IsDir":   dl.IsDir,
+					"Grabbed": rec,
+				})
+				return
+			}
+		}
+	}
+	if body.Action == "rm" || body.Action == "mv" || body.Action == "mkdir" {
+		audit.Append(AuditEntry{
+			At: time.Now(), Target: body.Kind + ":" + body.ID, Op: body.Action,
+			Path: body.Path, Dst: body.Dst, Msg: "已下发",
+		})
+	}
 	writeProto(w, msg)
 }
 
@@ -251,6 +276,10 @@ func (s *Service) upload(w http.ResponseWriter, r *http.Request) {
 		rpcErr(w, err)
 		return
 	}
+	audit.Append(AuditEntry{
+		At: time.Now(), Target: body.Kind + ":" + body.ID, Op: "upload",
+		Path: body.Path, Size: int64(len(data)), Msg: "已下发",
+	})
 	writeProto(w, resp)
 }
 

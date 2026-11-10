@@ -175,6 +175,32 @@ func DeleteBeacon(id string) {
 	}
 }
 
+func HasBeacon(id string) bool {
+	mgrMutex.Lock()
+	defer mgrMutex.Unlock()
+	return mgrStore != nil && mgrStore.Has(id)
+}
+
+// RequestDir queues a directory listing; see Store.RequestDir.
+func RequestDir(id, path string, force bool) (queued bool, pending bool) {
+	mgrMutex.Lock()
+	defer mgrMutex.Unlock()
+	if mgrStore == nil {
+		return false, false
+	}
+	return mgrStore.RequestDir(id, path, force)
+}
+
+// DirStatus returns the cached listing for a path; see Store.DirStatus.
+func DirStatus(id, path string) (DirListing, bool, bool) {
+	mgrMutex.Lock()
+	defer mgrMutex.Unlock()
+	if mgrStore == nil {
+		return DirListing{}, false, false
+	}
+	return mgrStore.DirStatus(id, path)
+}
+
 func QueueTask(id string, t Task) (Task, bool) {
 	mgrMutex.Lock()
 	defer mgrMutex.Unlock()

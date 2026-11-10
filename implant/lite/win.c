@@ -504,6 +504,218 @@ int list_dir(const char *path, unsigned char **out, size_t *out_len, int *err_co
     return 0;
 }
 
+static int win_rm_tree(const char *path, int depth, int *err_code) {
+    char *pattern;
+    size_t pl;
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    DWORD attrs;
+    int bad = 0;
+
+    if (depth <= 0) { *err_code = 2; return -1; }
+    pl = strlen(path);
+    pattern = (char *)malloc(pl + 3);
+    if (!pattern) { *err_code = 2; return -1; }
+    memcpy(pattern, path, pl);
+    if (pl && path[pl - 1] != '\\') pattern[pl++] = '\\';
+    pattern[pl++] = '*';
+    pattern[pl] = '\0';
+    h = FindFirstFileA(pattern, &fd);
+    free(pattern);
+    if (h == INVALID_HANDLE_VALUE) {
+        *err_code = 2;
+        return -1;
+    }
+    do {
+        const char *name = fd.cFileName;
+        char *full;
+        size_t nl = strlen(name), flen;
+        int sub = 0;
+        if (nl == 1 && name[0] == '.') continue;
+        if (nl == 2 && name[0] == '.' && name[1] == '.') continue;
+        full = (char *)malloc(pl + 1 + nl + 1);
+        if (!full) { bad = 1; break; }
+        memcpy(full, path, pl);
+        if (pl && path[pl - 1] != '\\') full[pl++] = '\\';
+        memcpy(full + pl, name, nl);
+        flen = pl + nl;
+        full[flen] = '\0';
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (win_rm_tree(full, depth - 1, &sub) != 0) bad = 1;
+        } else if (DeleteFileA(full) == 0) {
+            bad = 1;
+        }
+        free(full);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    if (bad) {
+        *err_code = 2;
+        return -1;
+    }
+    if (!RemoveDirectoryA(path)) {
+        *err_code = 2;
+        return -1;
+    }
+    return 0;
+}
+
+int fs_rm(const char *path, int recursive, int *err_code) {
+    DWORD attrs;
+    if (!path || !path[0]) { *err_code = 2; return 0; }
+    attrs = GetFileAttributesA(path);
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        DWORD e = GetLastError();
+        *err_code = (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) ? 1 : 2;
+        return 0;
+    }
+    if ((attrs & FILE_ATTRIBUTE_DIRECTORY) && !recursive) {
+        *err_code = 6;
+        return 0;
+    }
+    if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+        if (win_rm_tree(path, 32, err_code) != 0) return 0;
+        *err_code = 0;
+        return 0;
+    }
+    if (!DeleteFileA(path)) {
+        DWORD e = GetLastError();
+        *err_code = (e == ERROR_FILE_NOT_FOUND) ? 1 : 2;
+        return 0;
+    }
+    *err_code = 0;
+    return 0;
+}
+
+int fs_mv(const char *src, const char *dst, int *err_code) {
+    if (!src || !dst || !src[0] || !dst[0]) { *err_code = 2; return 0; }
+    if (!MoveFileExA(src, dst, MOVEFILE_REPLACE_EXISTING)) {
+        DWORD e = GetLastError();
+        *err_code = (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) ? 1 : 2;
+        return 0;
+    }
+    *err_code = 0;
+    return 0;
+}
+
+int fs_mkdir(const char *path, int *err_code) {
+    if (!path || !path[0]) { *err_code = 2; return 0; }
+    if (!CreateDirectoryA(path, NULL)) {
+        DWORD e = GetLastError();
+        *err_code = e == ERROR_ALREADY_EXISTS ? 5 : (e == ERROR_PATH_NOT_FOUND ? 1 : 2);
+        return 0;
+    }
+    *err_code = 0;
+    return 0;
+}
+
+static int win_file_meta(const char *path, unsigned long long *size, unsigned long long *mtime) {
+    HANDLE h;
+    LARGE_INTEGER sz;
+    FILETIME wt;
+
+    h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    if (!GetFileSizeEx(h, &sz) || !GetFileTime(h, NULL, NULL, &wt)) {
+        CloseHandle(h);
+        return 0;
+    }
+    CloseHandle(h);
+    if (sz.QuadPart < 0) return 0;
+    *size = (unsigned long long)sz.QuadPart;
+    {
+        ULARGE_INTEGER fti;
+        fti.HighPart = wt.dwHighDateTime;
+        fti.LowPart = wt.dwLowDateTime;
+        *mtime = fti.QuadPart >= 116444736000000000ULL
+                     ? (fti.QuadPart - 116444736000000000ULL) / 10000000ULL
+                     : 0;
+    }
+    return 1;
+}
+
+int fs_write_chunk(const char *path, uint32_t offset, uint64_t total,
+                   int64_t expect_size, int64_t expect_mtime, int force,
+                   const unsigned char *data, size_t data_len, int *err_code) {
+    char *tmp;
+    size_t pl;
+    HANDLE h;
+    LARGE_INTEGER pos;
+    unsigned long long size = 0, mtime = 0;
+    int exists;
+
+    if (!path || !path[0]) { *err_code = 2; return 0; }
+    if (total > FILE_MAX) { *err_code = 3; return 0; }
+    pl = strlen(path);
+    tmp = (char *)malloc(pl + sizeof(WRITE_TMP));
+    if (!tmp) { *err_code = 2; return 0; }
+    memcpy(tmp, path, pl);
+    memcpy(tmp + pl, WRITE_TMP, sizeof(WRITE_TMP));
+
+    exists = win_file_meta(path, &size, &mtime);
+    if (offset == 0) {
+        if (exists && !force) {
+            if (expect_size >= 0 && (unsigned long long)expect_size != size) {
+                free(tmp);
+                *err_code = 4;
+                return 0;
+            }
+            if (expect_mtime >= 0 && (unsigned long long)expect_mtime != mtime) {
+                free(tmp);
+                *err_code = 4;
+                return 0;
+            }
+        }
+        h = CreateFileA(tmp, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h == INVALID_HANDLE_VALUE) {
+            free(tmp);
+            *err_code = 2;
+            return 0;
+        }
+        CloseHandle(h);
+    }
+    h = CreateFileA(tmp, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        free(tmp);
+        *err_code = 2;
+        return 0;
+    }
+    pos.QuadPart = (LONGLONG)offset;
+    if (!SetFilePointerEx(h, pos, NULL, FILE_BEGIN)) {
+        CloseHandle(h);
+        free(tmp);
+        *err_code = 2;
+        return 0;
+    }
+    {
+        size_t off = 0;
+        while (off < data_len) {
+            DWORD w = 0;
+            if (!WriteFile(h, data + off, (DWORD)(data_len - off), &w, NULL) || w == 0) {
+                CloseHandle(h);
+                free(tmp);
+                *err_code = 2;
+                return 0;
+            }
+            off += w;
+        }
+    }
+    CloseHandle(h);
+    if ((uint64_t)offset + data_len >= total) {
+        if (exists) {
+            DWORD attrs = GetFileAttributesA(path);
+            if (attrs != INVALID_FILE_ATTRIBUTES) SetFileAttributesA(tmp, attrs);
+        }
+        if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) {
+            free(tmp);
+            *err_code = 2;
+            return 0;
+        }
+    }
+    free(tmp);
+    *err_code = 0;
+    return 0;
+}
+
 void host_info(char *hostname, size_t hn, char *username, size_t un,
                char *os, size_t on, char *arch, size_t an, uint32_t *pid) {
     DWORD n;

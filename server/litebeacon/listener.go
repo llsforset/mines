@@ -144,7 +144,7 @@ func handleCheckin(w http.ResponseWriter, r *http.Request, store *Store, secrets
 		notFound(w) // replay
 		return
 	}
-	store.PushResults(ci.BeaconID, ci.Execs, ci.Files, now)
+	store.PushResults(ci.BeaconID, ci.Execs, ci.Files, ci.Dirs, ci.Statuses, now)
 	tasks := store.TakeTasks(ci.BeaconID)
 	for _, task := range tasks {
 		if task.Type == TaskExit {
